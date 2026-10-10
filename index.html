@@ -251,7 +251,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
       </div>
       <label class="switch" for="countdown">Обратный отсчёт 3 секунды перед записью<input type="checkbox" id="countdown"></label>
       <label class="switch" for="hd">Высокое качество 1080p<input type="checkbox" id="hd"></label>
-      <p class="help">По умолчанию запись идёт в 720p: так она надёжнее. В 1080p на некоторых iPhone камера может останавливаться через несколько секунд записи.</p>
+      <p class="help">Если выключить, запись пойдёт в 720p: файлы будут меньше, а телефон будет меньше греться.</p>
       <label class="switch" for="diagOn">Показывать диагностику на экране<input type="checkbox" id="diagOn"></label>
       <button class="btn wide" id="btnReport" type="button">Отчёт для Claude</button>
       <p class="help">Чтобы открывать Суфлёр как приложение: в Safari нажми «Поделиться» → «На экран Домой». Записи хранятся в самом приложении, пока ты их не удалишь.</p>
@@ -321,7 +321,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     fontSize: store.get('fontSize', 30),
     dim: store.get('dim', 0.55),
     countdown: store.get('countdown', true),
-    hd: store.get('hd', false),
+    hd: store.get('hd', true),
   };
 
   const root = document.documentElement;
@@ -527,7 +527,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
   // track, recorder and page event. Used to find why the camera picture freezes on the iPhone.
   const diagLog = [];
   const t0 = performance.now();
-  let diagOn = store.get('diag', false), framesShown = 0, framesDrawn = 0;
+  let diagOn = store.get('diag', false), framesShown = 0;
   function dlog(msg) {
     diagLog.push(((performance.now() - t0) / 1000).toFixed(1) + 's ' + msg);
     if (diagLog.length > 400) diagLog.shift();
@@ -686,17 +686,15 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     const mime = pickMime();
     if (mime === null) { toast('Запись видео в этом браузере не поддерживается.'); return; }
     chunks = [];
-    // Bitrate is left to Safari: a forced high bitrate made the iPhone camera stall mid-recording.
     const opts = {};
     if (mime) opts.mimeType = mime;
-    const recStream = startCanvasPipe() || stream;
-    try { recorder = new MediaRecorder(recStream, opts); }
-    catch { recorder = new MediaRecorder(recStream); }
+    try { recorder = new MediaRecorder(stream, opts); }
+    catch { recorder = new MediaRecorder(stream); }
     recorder.ondataavailable = (e) => { dlog('recorder data ' + (e.data ? e.data.size : 0) + ' bytes'); if (e.data && e.data.size) chunks.push(e.data); };
     recorder.onstop = finishRecording;
     recorder.onerror = (e) => dlog('recorder ERROR ' + (e.error && e.error.name));
     recorder.start();
-    dlog(`recording start mime=${recorder.mimeType || mime} via=${pipe ? 'canvas ' + pipe.canvas.width + 'x' + pipe.canvas.height : 'camera'}`);
+    dlog(`recording start mime=${recorder.mimeType || mime}`);
     recStart = Date.now();
     document.body.classList.add('recording');
     $('#btnFlip').disabled = true;
@@ -705,38 +703,6 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     timerId = setInterval(updateTimer, 500);
     setPlaying(true);
     requestWakeLock();
-  }
-
-  // The recorder encodes a canvas copy of the camera picture instead of the camera track itself.
-  // Feeding the camera track straight into MediaRecorder made the iPhone camera stop after ~15-20 s
-  // (audio kept going); with the canvas in between the camera only feeds the on-screen <video>.
-  let pipe = null;
-  function startCanvasPipe() {
-    if (!HTMLCanvasElement.prototype.captureStream || !cam.videoWidth) return null;
-    const canvas = document.createElement('canvas');
-    canvas.width = cam.videoWidth;
-    canvas.height = cam.videoHeight;
-    canvas.style.cssText = 'position:fixed;left:-10000px;top:0;width:2px;height:2px;pointer-events:none';
-    document.body.appendChild(canvas);
-    const ctx = canvas.getContext('2d');
-    pipe = { canvas, active: true, handle: 0 };
-    const draw = () => {
-      if (!pipe || !pipe.active) return;
-      if (cam.readyState >= 2) { ctx.drawImage(cam, 0, 0, canvas.width, canvas.height); framesDrawn += 1; }
-      pipe.handle = canWatchFrames ? cam.requestVideoFrameCallback(draw) : requestAnimationFrame(draw);
-    };
-    draw();
-    let video;
-    try { video = canvas.captureStream(30); } catch { canvas.remove(); pipe = null; return null; }
-    pipe.video = video;
-    return new MediaStream([...video.getVideoTracks(), ...stream.getAudioTracks()]);
-  }
-  function stopCanvasPipe() {
-    if (!pipe) return;
-    pipe.active = false;
-    if (pipe.video) pipe.video.getTracks().forEach((t) => t.stop());
-    pipe.canvas.remove();
-    pipe = null;
   }
 
   function stopRecording() {
@@ -753,7 +719,6 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
   async function finishRecording() {
     const type = (recorder && recorder.mimeType) || 'video/mp4';
     recorder = null;
-    stopCanvasPipe();
     clearInterval(timerId);
     document.body.classList.remove('recording');
     $('#btnFlip').disabled = false;
@@ -764,10 +729,11 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
       startCamera();
     }
     if (!chunks.length) { toast('Запись получилась пустой. Попробуй ещё раз.'); return; }
-    const blob = new Blob(chunks, { type });
+    let blob = new Blob(chunks, { type });
     chunks = [];
+    if (type.includes('mp4')) blob = await repairMp4(blob);
     const created = Date.now();
-    const item = { id: created, name: `Video_${stamp(new Date(created))}.${type.includes('mp4') ? 'mp4' : 'webm'}`, type, created, size: blob.size, blob };
+    const item = { id: created, name: `Video_${stamp(new Date(created))}.${type.includes('mp4') ? 'mp4' : 'webm'}`, type, created, size: blob.size, blob, repaired: true };
     try { await db.put(item); } catch { toast('Не удалось сохранить запись в приложении. Сохрани её сразу.'); }
     openReview(item);
   }
@@ -775,6 +741,86 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
   function stamp(d) {
     const p = (n) => String(n).padStart(2, '0');
     return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}`;
+  }
+
+  // ---------- Safari MP4 repair ----------
+  // Safari's MediaRecorder sometimes writes one video sample with a duration of 0xFFFFFFFF ticks
+  // (about 83 days). Photos, Files and Safari hold that frame for the whole duration, so the
+  // picture freezes while the sound plays on. Only the small moof headers are read; each bad
+  // duration is overwritten with a neighbouring sample's duration. No re-encoding, same file size,
+  // and the original blob is kept if anything goes wrong.
+  const BAD_DURATION = 0xFFFFFFFF;
+  const fourcc = (v, o) => String.fromCharCode(v.getUint8(o), v.getUint8(o + 1), v.getUint8(o + 2), v.getUint8(o + 3));
+
+  function findBadDurations(moof, base, out) {
+    for (let p = 8; p + 8 <= moof.byteLength;) {
+      const size = moof.getUint32(p);
+      if (size < 8) break;
+      if (fourcc(moof, p + 4) === 'traf') {
+        const end = Math.min(moof.byteLength, p + size);
+        let fallback = 1;
+        for (let q = p + 8; q + 16 <= end;) {
+          const childSize = moof.getUint32(q);
+          if (childSize < 8) break;
+          const type = fourcc(moof, q + 4);
+          const flags = moof.getUint32(q + 8) & 0xffffff;
+          if (type === 'tfhd' && (flags & 0x8)) {
+            // after track_ID: base_data_offset (0x1, 8 bytes), sample_description_index (0x2, 4 bytes)
+            const o = q + 16 + ((flags & 0x1) ? 8 : 0) + ((flags & 0x2) ? 4 : 0);
+            if (o + 4 <= end) {
+              const d = moof.getUint32(o);
+              if (d === BAD_DURATION) out.push({ at: base + o, value: 1 }); else if (d > 0) fallback = d;
+            }
+          }
+          if (type === 'trun' && (flags & 0x100)) {
+            const count = moof.getUint32(q + 12);
+            let o = q + 16 + ((flags & 0x1) ? 4 : 0) + ((flags & 0x4) ? 4 : 0);
+            const stride = 4 + ((flags & 0x200) ? 4 : 0) + ((flags & 0x400) ? 4 : 0) + ((flags & 0x800) ? 4 : 0);
+            const bad = [];
+            for (let i = 0; i < count && o + 4 <= end; i++, o += stride) {
+              const d = moof.getUint32(o);
+              if (d === BAD_DURATION) bad.push(o); else if (d > 0) fallback = d;
+            }
+            for (const at of bad) out.push({ at: base + at, value: fallback });
+          }
+          q += childSize;
+        }
+      }
+      p += size;
+    }
+  }
+
+  async function repairMp4(blob) {
+    try {
+      const fixes = [];
+      for (let pos = 0; pos + 8 <= blob.size;) {
+        const head = new DataView(await blob.slice(pos, pos + 16).arrayBuffer());
+        let size = head.getUint32(0), header = 8;
+        if (size === 1 && head.byteLength >= 16) { size = Number(head.getBigUint64(8)); header = 16; }
+        else if (size === 0) size = blob.size - pos;
+        if (size < header) break;
+        if (fourcc(head, 4) === 'moof') {
+          findBadDurations(new DataView(await blob.slice(pos, pos + size).arrayBuffer()), pos, fixes);
+        }
+        pos += size;
+      }
+      dlog(`mp4 repair: ${fixes.length} bad duration(s)`);
+      if (!fixes.length) return blob;
+      fixes.sort((a, b) => a.at - b.at);
+      const parts = [];
+      let last = 0;
+      for (const f of fixes) {
+        const bytes = new Uint8Array(4);
+        new DataView(bytes.buffer).setUint32(0, f.value);
+        parts.push(blob.slice(last, f.at), bytes);
+        last = f.at + 4;
+      }
+      parts.push(blob.slice(last));
+      return new Blob(parts, { type: blob.type });
+    } catch (e) {
+      dlog('mp4 repair failed: ' + (e && e.message));
+      return blob;
+    }
   }
 
   // ---------- Storage of recordings (IndexedDB) ----------
@@ -803,7 +849,13 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
   let current = null, currentUrl = null, deleteArmed = false;
   const reviewVideo = $('#reviewVideo');
 
-  function openReview(item) {
+  async function openReview(item) {
+    if (!item.repaired && item.type.includes('mp4')) {
+      item.blob = await repairMp4(item.blob);
+      item.size = item.blob.size;
+      item.repaired = true;
+      try { await db.put(item); } catch {}
+    }
     current = item;
     currentUrl = URL.createObjectURL(item.blob);
     reviewVideo.src = currentUrl;
@@ -888,16 +940,16 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     navigator.serviceWorker.register('sw.js').catch(() => {});
   }
 
-  // One sample per second: frames painted (fps), frames copied for recording, video clock, track state.
-  let lastSample = { shown: 0, drawn: 0 };
+  // One sample per second: frames painted (fps), video clock, track state.
+  let lastSample = { shown: 0 };
   setInterval(() => {
     const vt = stream && stream.getVideoTracks()[0];
     const at = stream && stream.getAudioTracks()[0];
-    const line = `fps=${framesShown - lastSample.shown} rec_fps=${framesDrawn - lastSample.drawn}` +
+    const line = `fps=${framesShown - lastSample.shown}` +
       ` t=${cam.currentTime.toFixed(1)} vtrack=${vt ? vt.readyState + (vt.muted ? '/muted' : '') : '-'}` +
       ` atrack=${at ? at.readyState + (at.muted ? '/muted' : '') : '-'} video=${cam.paused ? 'paused' : 'play'}/${cam.readyState}` +
       ` rec=${recorder ? recorder.state : '-'} offset=${Math.round(offset)}/${Math.round(contentH)}`;
-    lastSample = { shown: framesShown, drawn: framesDrawn };
+    lastSample = { shown: framesShown };
     dlog(line);
     if (diagOn) $('#diag').textContent = line.split(' ').join('\n');
   }, 1000);

@@ -1,4 +1,4 @@
-const CACHE = 'suflyor-v6';
+const CACHE = 'suflyor-v7';
 const ASSETS = ['./', './index.html', './manifest.webmanifest', './icons/icon-180.png', './icons/icon-192.png', './icons/icon-512.png'];
 
 self.addEventListener('install', (e) => {
