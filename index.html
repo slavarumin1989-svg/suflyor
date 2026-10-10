@@ -643,8 +643,9 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     // Bitrate is left to Safari: a forced high bitrate made the iPhone camera stall mid-recording.
     const opts = {};
     if (mime) opts.mimeType = mime;
-    try { recorder = new MediaRecorder(stream, opts); }
-    catch { recorder = new MediaRecorder(stream); }
+    const recStream = startCanvasPipe() || stream;
+    try { recorder = new MediaRecorder(recStream, opts); }
+    catch { recorder = new MediaRecorder(recStream); }
     recorder.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
     recorder.onstop = finishRecording;
     recorder.start();
@@ -656,6 +657,38 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     timerId = setInterval(updateTimer, 500);
     setPlaying(true);
     requestWakeLock();
+  }
+
+  // The recorder encodes a canvas copy of the camera picture instead of the camera track itself.
+  // Feeding the camera track straight into MediaRecorder made the iPhone camera stop after ~15-20 s
+  // (audio kept going); with the canvas in between the camera only feeds the on-screen <video>.
+  let pipe = null;
+  function startCanvasPipe() {
+    if (!HTMLCanvasElement.prototype.captureStream || !cam.videoWidth) return null;
+    const canvas = document.createElement('canvas');
+    canvas.width = cam.videoWidth;
+    canvas.height = cam.videoHeight;
+    canvas.style.cssText = 'position:fixed;left:-10000px;top:0;width:2px;height:2px;pointer-events:none';
+    document.body.appendChild(canvas);
+    const ctx = canvas.getContext('2d');
+    pipe = { canvas, active: true, handle: 0 };
+    const draw = () => {
+      if (!pipe || !pipe.active) return;
+      if (cam.readyState >= 2) ctx.drawImage(cam, 0, 0, canvas.width, canvas.height);
+      pipe.handle = canWatchFrames ? cam.requestVideoFrameCallback(draw) : requestAnimationFrame(draw);
+    };
+    draw();
+    let video;
+    try { video = canvas.captureStream(30); } catch { canvas.remove(); pipe = null; return null; }
+    pipe.video = video;
+    return new MediaStream([...video.getVideoTracks(), ...stream.getAudioTracks()]);
+  }
+  function stopCanvasPipe() {
+    if (!pipe) return;
+    pipe.active = false;
+    if (pipe.video) pipe.video.getTracks().forEach((t) => t.stop());
+    pipe.canvas.remove();
+    pipe = null;
   }
 
   function stopRecording() {
@@ -671,6 +704,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
   async function finishRecording() {
     const type = (recorder && recorder.mimeType) || 'video/mp4';
     recorder = null;
+    stopCanvasPipe();
     clearInterval(timerId);
     document.body.classList.remove('recording');
     $('#btnFlip').disabled = false;
