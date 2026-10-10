@@ -295,7 +295,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
 (() => {
   const $ = (s) => document.querySelector(s);
   // Bump on every release: shown in Settings and in the report, so it's clear which copy the phone runs.
-  const APP_VERSION = 10;
+  const APP_VERSION = 11;
 
   // ---------- Settings storage ----------
   const store = {
@@ -743,10 +743,27 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
       ...(aconfig ? { audio: { codec: 'aac', sampleRate: aconfig.sampleRate, numberOfChannels: 1 } } : {}),
     });
 
-    let failure = null;
+    // Safari leaves EncodedVideoChunk/EncodedAudioChunk.duration null, which mp4-muxer rejects, so chunks
+    // go in through the raw methods with a fallback duration (the muxer derives the real one from the
+    // next sample's timestamp anyway).
+    const chunkBytes = (chunk) => { const data = new Uint8Array(chunk.byteLength); chunk.copyTo(data); return data; };
+    let failure = null, firstVideoChunk = true;
+    const fail = (e) => {
+      if (failure) return;
+      failure = e;
+      dlog('recording error: ' + e.message);
+      setTimeout(() => { if (recorder && recorder.state === 'recording') stopRecording(); }, 0);
+    };
     const venc = new VideoEncoder({
-      output: (chunk, meta) => { try { muxer.addVideoChunk(chunk, meta); } catch (e) { failure = failure || e; } },
-      error: (e) => { failure = failure || e; dlog('video encoder ERROR ' + e.message); },
+      output: (chunk, meta) => {
+        if (firstVideoChunk) {
+          firstVideoChunk = false;
+          const d = meta && meta.decoderConfig;
+          dlog(`first video chunk: ${chunk.type}, duration ${chunk.duration}, description ${d && d.description ? d.description.byteLength + ' bytes' : 'missing'}`);
+        }
+        try { muxer.addVideoChunkRaw(chunkBytes(chunk), chunk.type, chunk.timestamp, chunk.duration ?? 33333, meta); } catch (e) { fail(e); }
+      },
+      error: (e) => fail(e),
     });
     venc.configure(vconfig);
 
@@ -755,8 +772,10 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
       aenc = new AudioEncoder({
         // Safari's AAC decoderConfig.description is a whole esds box instead of an AudioSpecificConfig
         // (WebKit bug 302253) and would give a silent track, so meta is not passed: the muxer writes its own.
-        output: (chunk) => { try { muxer.addAudioChunk(chunk); } catch (e) { failure = failure || e; } },
-        error: (e) => { failure = failure || e; dlog('audio encoder ERROR ' + e.message); },
+        output: (chunk) => {
+          try { muxer.addAudioChunkRaw(chunkBytes(chunk), chunk.type, chunk.timestamp, chunk.duration ?? Math.round(1024 / aconfig.sampleRate * 1e6)); } catch (e) { fail(e); }
+        },
+        error: (e) => fail(e),
       });
       aenc.configure(aconfig);
     }
