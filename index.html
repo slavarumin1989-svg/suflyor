@@ -1,0 +1,662 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Суфлёр">
+<meta name="theme-color" content="#000000">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<title>Суфлёр</title>
+<style>
+/* Layout: camera fills the screen; prompter panel on top near the lens; controls docked at the bottom. */
+:root {
+  --ink: #ffffff;
+  --muted: rgba(235, 235, 245, 0.6);
+  --glass: rgba(0, 0, 0, 0.42);
+  --chip: rgba(255, 255, 255, 0.16);
+  --accent: #ffd60a;
+  --rec: #ff3b30;
+  --sheet: #1c1c1e;
+  --sheet-2: #2c2c2e;
+  --fs: 30px;
+  --dim: 0.55;
+  --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+[hidden] { display: none !important; }
+html, body { height: 100%; margin: 0; overflow: hidden; background: #000; color: var(--ink); font-family: var(--font); -webkit-user-select: none; user-select: none; touch-action: manipulation; }
+button { font: inherit; color: inherit; border: 0; background: none; padding: 0; cursor: pointer; }
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+svg { width: 22px; height: 22px; display: block; }
+
+#cam { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; background: #000; }
+#cam.mirror { transform: scaleX(-1); }
+
+#app {
+  position: fixed; inset: 0; display: flex; flex-direction: column; gap: 8px;
+  padding: calc(env(safe-area-inset-top, 0px) + 8px) calc(env(safe-area-inset-right, 0px) + 8px)
+           calc(env(safe-area-inset-bottom, 0px) + 8px) calc(env(safe-area-inset-left, 0px) + 8px);
+}
+
+.top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; border-radius: 999px; background: var(--glass); font-size: 15px; font-weight: 600; -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); }
+.pill svg { width: 18px; height: 18px; }
+.timer { display: inline-flex; align-items: center; gap: 8px; padding: 8px 14px; border-radius: 999px; background: var(--glass); font-weight: 600; font-variant-numeric: tabular-nums; }
+.timer .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--rec); animation: blink 1s steps(2) infinite; }
+@keyframes blink { 50% { opacity: 0.25; } }
+body.recording .top .pill { opacity: 0.35; pointer-events: none; }
+
+#prompter {
+  position: relative; height: 40%; flex: none; overflow: hidden; border-radius: 16px;
+  background: rgba(0, 0, 0, var(--dim)); touch-action: none;
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 9%, #000 86%, transparent 100%);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 9%, #000 86%, transparent 100%);
+}
+#track { position: absolute; left: 0; right: 0; top: 0; padding: 0 22px 0 28px; will-change: transform; }
+#text { white-space: pre-wrap; word-wrap: break-word; font-size: var(--fs); font-weight: 600; line-height: 1.3; text-shadow: 0 1px 2px rgba(0,0,0,0.5); }
+#marker { position: absolute; left: 8px; width: 0; height: 0; border-top: 7px solid transparent; border-bottom: 7px solid transparent; border-left: 11px solid var(--accent); }
+
+.spacer { flex: 1; }
+
+.controls {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 14px 10px;
+  padding: 12px 18px; border-radius: 24px; background: var(--glass);
+  -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px);
+}
+.speed { order: -1; flex: 1 1 100%; display: flex; align-items: center; gap: 12px; font-size: 14px; }
+.speed label { color: var(--muted); }
+.speed output { width: 34px; text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+input[type=range] { flex: 1; min-width: 0; accent-color: var(--accent); height: 28px; }
+.round { width: 46px; height: 46px; border-radius: 50%; background: var(--chip); display: grid; place-items: center; }
+.round:disabled { opacity: 0.35; }
+#btnRec { width: 74px; height: 74px; border-radius: 50%; border: 4px solid #fff; display: grid; place-items: center; }
+#btnRec span { width: 58px; height: 58px; border-radius: 29px; background: var(--rec); transition: all 0.2s ease; }
+body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
+
+@media (orientation: landscape) {
+  #prompter { height: 50%; }
+  .controls { flex-wrap: nowrap; padding: 6px 16px; }
+  .speed { order: 0; flex: 1 1 auto; }
+  #btnRec { width: 62px; height: 62px; }
+  #btnRec span { width: 48px; height: 48px; }
+}
+
+#count { position: fixed; inset: 0; display: grid; place-items: center; font-size: 150px; font-weight: 800; text-shadow: 0 4px 24px rgba(0,0,0,0.6); pointer-events: none; }
+#count span { animation: pop 1s ease-out; }
+@keyframes pop { from { transform: scale(1.5); opacity: 0; } 30% { transform: scale(1); opacity: 1; } }
+
+#notice { position: fixed; left: 16px; right: 16px; top: 50%; transform: translateY(-50%); margin: 0 auto; max-width: 420px; padding: 24px; border-radius: 20px; background: var(--sheet); text-align: center; display: grid; gap: 14px; }
+#notice p { margin: 0; line-height: 1.45; }
+
+.toast { position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom, 0px) + 130px); transform: translateX(-50%); padding: 10px 16px; border-radius: 12px; background: rgba(28,28,30,0.95); font-size: 15px; max-width: calc(100% - 32px); text-align: center; z-index: 50; }
+
+/* Sheets */
+.backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 20; display: flex; align-items: flex-end; justify-content: center; }
+.sheet {
+  width: 100%; max-width: 640px; max-height: 92%; display: flex; flex-direction: column;
+  background: var(--sheet); border-radius: 18px 18px 0 0; padding-bottom: env(safe-area-inset-bottom, 0px);
+  animation: up 0.25s ease-out; -webkit-user-select: text; user-select: text;
+}
+.sheet.tall { height: 92%; }
+@keyframes up { from { transform: translateY(40px); opacity: 0; } }
+.sheet-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; border-bottom: 1px solid rgba(255,255,255,0.08); }
+.sheet-head h2 { margin: 0; font-size: 17px; font-weight: 600; }
+.link { color: var(--accent); font-size: 17px; padding: 4px 2px; }
+.link.strong { font-weight: 600; }
+.sheet-body { padding: 16px; overflow-y: auto; display: grid; gap: 18px; align-content: start; flex: 1; min-height: 0; }
+
+#scriptInput { width: 100%; height: 100%; min-height: 200px; resize: none; border: 0; outline: 0; border-radius: 12px; padding: 14px; background: var(--sheet-2); color: var(--ink); font: 17px/1.45 var(--font); }
+.editor-body { display: flex; flex-direction: column; gap: 12px; }
+.editor-body textarea { flex: 1; }
+.row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.meta { color: var(--muted); font-size: 14px; font-variant-numeric: tabular-nums; }
+.btn { padding: 12px 16px; border-radius: 12px; background: var(--sheet-2); font-weight: 600; font-size: 16px; }
+.btn.primary { background: var(--accent); color: #000; }
+.btn.danger { color: var(--rec); }
+.btn.wide { width: 100%; }
+
+.field { display: grid; gap: 8px; }
+.field .row { flex-wrap: nowrap; }
+.field label { font-size: 15px; }
+.field output { color: var(--muted); font-variant-numeric: tabular-nums; }
+.switch { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 15px; }
+.switch input { width: 22px; height: 22px; accent-color: var(--accent); }
+.help { color: var(--muted); font-size: 14px; line-height: 1.5; margin: 0; }
+
+#reviewVideo { width: 100%; max-height: 52vh; border-radius: 12px; background: #000; }
+.actions { display: grid; gap: 10px; }
+
+.list { display: grid; gap: 8px; }
+.item { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 14px; border-radius: 12px; background: var(--sheet-2); text-align: left; width: 100%; }
+.item b { display: block; font-size: 15px; font-weight: 600; }
+.item small { color: var(--muted); font-size: 13px; }
+.empty { color: var(--muted); text-align: center; padding: 24px 0; }
+
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+</head>
+<body>
+<video id="cam" playsinline autoplay muted></video>
+
+<div id="app">
+  <header class="top">
+    <button class="pill" id="btnText" type="button">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 11h16M4 16h10"/></svg>Текст
+    </button>
+    <div class="timer" id="timer" hidden><span class="dot"></span><span id="timerVal">00:00</span></div>
+    <button class="pill" id="btnRecs" type="button">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M10 9.5v5l4.5-2.5z" fill="currentColor"/></svg>Записи
+    </button>
+  </header>
+
+  <section id="prompter" aria-label="Текст сценария">
+    <div id="track"><div id="text"></div></div>
+    <div id="marker"></div>
+  </section>
+
+  <div class="spacer"></div>
+
+  <footer class="controls">
+    <button class="round" id="btnReset" type="button" aria-label="В начало текста">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 5h2.4v14H6zM19 5.5v13L9.5 12z"/></svg>
+    </button>
+    <button class="round" id="btnPlay" type="button" aria-label="Прокрутка">
+      <svg viewBox="0 0 24 24" fill="currentColor"><path id="playIcon" d="M8 5v14l11-7z"/></svg>
+    </button>
+    <div class="speed">
+      <label for="speed">Скорость</label>
+      <input type="range" id="speed" min="10" max="200" step="1">
+      <output id="speedVal" for="speed">40</output>
+    </div>
+    <button id="btnRec" type="button" aria-label="Запись"><span></span></button>
+    <button class="round" id="btnSettings" type="button" aria-label="Настройки">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/></svg>
+    </button>
+    <button class="round" id="btnFlip" type="button" aria-label="Сменить камеру">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8h3l1.5-2h7L17 8h3v11H4z"/><path d="M9 13.5a3 3 0 0 1 5.2-2M15 12.5a3 3 0 0 1-5.2 2"/><path d="M14.4 9.6v2h-2M9.6 16.4v-2h2"/></svg>
+    </button>
+  </footer>
+</div>
+
+<div id="count" hidden></div>
+
+<div id="notice" hidden>
+  <p id="noticeText"></p>
+  <button class="btn primary" id="btnRetry" type="button">Включить камеру</button>
+</div>
+
+<!-- Script editor -->
+<div class="backdrop" id="editorSheet" hidden>
+  <div class="sheet tall" role="dialog" aria-labelledby="editorTitle">
+    <div class="sheet-head">
+      <button class="link" type="button" data-close>Отмена</button>
+      <h2 id="editorTitle">Сценарий</h2>
+      <button class="link strong" id="btnSaveScript" type="button">Готово</button>
+    </div>
+    <div class="sheet-body editor-body">
+      <textarea id="scriptInput" placeholder="Вставь или напиши текст, который будешь читать"></textarea>
+      <div class="row">
+        <button class="btn" id="btnPaste" type="button">Вставить из буфера</button>
+        <span class="meta" id="scriptMeta"></span>
+        <button class="btn danger" id="btnClear" type="button">Очистить</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Settings -->
+<div class="backdrop" id="settingsSheet" hidden>
+  <div class="sheet" role="dialog" aria-labelledby="settingsTitle">
+    <div class="sheet-head">
+      <span></span>
+      <h2 id="settingsTitle">Настройки</h2>
+      <button class="link strong" type="button" data-close>Готово</button>
+    </div>
+    <div class="sheet-body">
+      <div class="field">
+        <div class="row"><label for="fontSize">Размер шрифта</label><output id="fontSizeVal"></output></div>
+        <input type="range" id="fontSize" min="16" max="72" step="1">
+      </div>
+      <div class="field">
+        <div class="row"><label for="dim">Затемнение под текстом</label><output id="dimVal"></output></div>
+        <input type="range" id="dim" min="0" max="0.9" step="0.05">
+      </div>
+      <div class="field">
+        <div class="row"><label for="speed2">Скорость прокрутки</label><output id="speed2Val"></output></div>
+        <input type="range" id="speed2" min="10" max="200" step="1">
+      </div>
+      <label class="switch" for="countdown">Обратный отсчёт 3 секунды перед записью<input type="checkbox" id="countdown"></label>
+      <p class="help">Чтобы открывать Суфлёр как приложение: в Safari нажми «Поделиться» → «На экран Домой». Записи хранятся в самом приложении, пока ты их не удалишь.</p>
+    </div>
+  </div>
+</div>
+
+<!-- Review -->
+<div class="backdrop" id="reviewSheet" hidden>
+  <div class="sheet tall" role="dialog" aria-labelledby="reviewTitle">
+    <div class="sheet-head">
+      <button class="link" id="btnDelete" type="button">Удалить</button>
+      <h2 id="reviewTitle">Видео</h2>
+      <button class="link strong" type="button" data-close>Готово</button>
+    </div>
+    <div class="sheet-body">
+      <video id="reviewVideo" controls playsinline></video>
+      <div class="actions">
+        <button class="btn primary wide" id="btnShare" type="button">Сохранить или отправить</button>
+        <p class="help">В открывшемся меню выбери «Сохранить видео», чтобы оно попало в Фото, или Яндекс Диск, Telegram, «Сохранить в Файлы».</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Recordings -->
+<div class="backdrop" id="recsSheet" hidden>
+  <div class="sheet tall" role="dialog" aria-labelledby="recsTitle">
+    <div class="sheet-head">
+      <span></span>
+      <h2 id="recsTitle">Записи</h2>
+      <button class="link strong" type="button" data-close>Готово</button>
+    </div>
+    <div class="sheet-body"><div class="list" id="recsList"></div></div>
+  </div>
+</div>
+
+<script>
+(() => {
+  const $ = (s) => document.querySelector(s);
+
+  // ---------- Settings storage ----------
+  const store = {
+    get(key, fallback) {
+      try { const v = localStorage.getItem(key); return v === null ? fallback : JSON.parse(v); } catch { return fallback; }
+    },
+    set(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch {} },
+  };
+
+  const SAMPLE = `Привет! Это телесуфлёр.
+
+Нажми «Текст» вверху, чтобы вставить свой сценарий.
+
+Ползунок «Скорость» меняет скорость прокрутки. Подбери её под свой темп речи, можно прямо во время записи.
+
+Тапни по тексту, и прокрутка встанет на паузу или продолжится. Текст можно двигать пальцем.
+
+Красная кнопка запускает запись: сначала обратный отсчёт, потом текст поедет сам.
+
+Поверни телефон, и получится горизонтальное видео.
+
+Удачной съёмки!`;
+
+  const state = {
+    script: store.get('script', SAMPLE),
+    speed: store.get('speed', 40),
+    fontSize: store.get('fontSize', 30),
+    dim: store.get('dim', 0.55),
+    countdown: store.get('countdown', true),
+  };
+
+  const root = document.documentElement;
+  const prompter = $('#prompter'), track = $('#track'), textEl = $('#text'), marker = $('#marker');
+
+  function applySettings() {
+    textEl.textContent = state.script.trim() ? state.script : 'Нажми «Текст», чтобы добавить сценарий';
+    root.style.setProperty('--fs', state.fontSize + 'px');
+    root.style.setProperty('--dim', state.dim);
+    for (const id of ['speed', 'speed2']) $('#' + id).value = state.speed;
+    $('#speedVal').textContent = $('#speed2Val').textContent = Math.round(state.speed);
+    $('#fontSize').value = state.fontSize; $('#fontSizeVal').textContent = state.fontSize;
+    $('#dim').value = state.dim; $('#dimVal').textContent = Math.round(state.dim * 100) + '%';
+    $('#countdown').checked = state.countdown;
+    measure();
+  }
+
+  // ---------- Prompter ----------
+  let offset = 0, playing = false, contentH = 0, lastT = null;
+  let drag = null;
+
+  const readingLine = () => prompter.clientHeight * 0.22;
+  const clamp = (v) => Math.min(Math.max(v, 0), contentH);
+
+  function measure() {
+    contentH = textEl.offsetHeight;
+    offset = clamp(offset);
+    marker.style.top = (readingLine() + state.fontSize * 0.65 - 7) + 'px';
+    render();
+  }
+  function render() { track.style.transform = `translate3d(0, ${readingLine() - offset}px, 0)`; }
+
+  function setPlaying(on) {
+    playing = on;
+    $('#playIcon').setAttribute('d', on ? 'M7 5h4v14H7zm6 0h4v14h-4z' : 'M8 5v14l11-7z');
+  }
+
+  function tick(t) {
+    if (playing && !drag) {
+      if (lastT !== null) {
+        offset += state.speed * Math.min((t - lastT) / 1000, 0.1);
+        if (offset >= contentH) { offset = contentH; setPlaying(false); }
+        render();
+      }
+      lastT = t;
+    } else {
+      lastT = null;
+    }
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+
+  prompter.addEventListener('pointerdown', (e) => {
+    drag = { y: e.clientY, start: offset, moved: false };
+    prompter.setPointerCapture(e.pointerId);
+  });
+  prompter.addEventListener('pointermove', (e) => {
+    if (!drag) return;
+    const dy = e.clientY - drag.y;
+    if (Math.abs(dy) > 4) drag.moved = true;
+    if (drag.moved) { offset = clamp(drag.start - dy); render(); }
+  });
+  const endDrag = () => {
+    if (drag && !drag.moved) setPlaying(!playing);
+    drag = null;
+  };
+  prompter.addEventListener('pointerup', endDrag);
+  prompter.addEventListener('pointercancel', () => { drag = null; });
+
+  new ResizeObserver(measure).observe(prompter);
+  new ResizeObserver(measure).observe(textEl);
+
+  $('#btnPlay').onclick = () => setPlaying(!playing);
+  $('#btnReset').onclick = () => { offset = 0; render(); };
+
+  const onSpeed = (e) => { state.speed = +e.target.value; store.set('speed', state.speed); applySettings(); };
+  $('#speed').oninput = onSpeed;
+  $('#speed2').oninput = onSpeed;
+  $('#fontSize').oninput = (e) => { state.fontSize = +e.target.value; store.set('fontSize', state.fontSize); applySettings(); };
+  $('#dim').oninput = (e) => { state.dim = +e.target.value; store.set('dim', state.dim); applySettings(); };
+  $('#countdown').onchange = (e) => { state.countdown = e.target.checked; store.set('countdown', state.countdown); };
+
+  // ---------- Sheets ----------
+  function openSheet(id) { $(id).hidden = false; }
+  function closeSheet(el) {
+    el.hidden = true;
+    if (el.id === 'reviewSheet') closeReview();
+  }
+  document.querySelectorAll('.backdrop').forEach((bd) => {
+    bd.addEventListener('click', (e) => { if (e.target === bd) closeSheet(bd); });
+    bd.querySelectorAll('[data-close]').forEach((b) => b.addEventListener('click', () => closeSheet(bd)));
+  });
+
+  let toastTimer;
+  function toast(msg) {
+    let el = document.querySelector('.toast');
+    if (!el) { el = document.createElement('div'); el.className = 'toast'; document.body.appendChild(el); }
+    el.textContent = msg;
+    el.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { el.hidden = true; }, 3000);
+  }
+
+  // Editor
+  const scriptInput = $('#scriptInput');
+  function updateMeta() {
+    const words = scriptInput.value.split(/\s+/).filter(Boolean).length;
+    const sec = Math.round(words / 130 * 60);
+    $('#scriptMeta').textContent = `${words} слов · ~${sec < 60 ? sec + ' сек' : Math.floor(sec / 60) + ' мин ' + (sec % 60) + ' сек'}`;
+  }
+  $('#btnText').onclick = () => { scriptInput.value = state.script; updateMeta(); openSheet('#editorSheet'); };
+  scriptInput.oninput = updateMeta;
+  $('#btnPaste').onclick = async () => {
+    try { const t = await navigator.clipboard.readText(); if (t) { scriptInput.value = t; updateMeta(); } }
+    catch { toast('Не получилось прочитать буфер. Нажми в поле и выбери «Вставить».'); }
+  };
+  $('#btnClear').onclick = () => { scriptInput.value = ''; updateMeta(); scriptInput.focus(); };
+  $('#btnSaveScript').onclick = () => {
+    state.script = scriptInput.value;
+    store.set('script', state.script);
+    offset = 0; setPlaying(false);
+    applySettings();
+    closeSheet($('#editorSheet'));
+  };
+
+  $('#btnSettings').onclick = () => openSheet('#settingsSheet');
+
+  // ---------- Camera ----------
+  const cam = $('#cam');
+  let stream = null, facing = 'user', hasAudio = true;
+
+  function stopStream() { if (stream) stream.getTracks().forEach((t) => t.stop()); stream = null; }
+
+  async function startCamera() {
+    $('#notice').hidden = true;
+    stopStream();
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      showNotice('Этот браузер не даёт доступ к камере. Открой страницу в Safari.');
+      return;
+    }
+    const video = { facingMode: facing, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } };
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video, audio: true });
+      hasAudio = true;
+    } catch (err) {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video, audio: false });
+        hasAudio = false;
+        toast('Нет доступа к микрофону: видео будет без звука.');
+      } catch (err2) {
+        showNotice('Нет доступа к камере. Разреши его: Настройки → Safari → Камера и Микрофон → «Разрешить», потом нажми кнопку ниже.');
+        return;
+      }
+    }
+    cam.srcObject = stream;
+    cam.classList.toggle('mirror', facing === 'user');
+    try { await cam.play(); } catch {}
+  }
+
+  function showNotice(text) { $('#noticeText').textContent = text; $('#notice').hidden = false; }
+  $('#btnRetry').onclick = startCamera;
+
+  $('#btnFlip').onclick = () => {
+    if (recorder) return;
+    facing = facing === 'user' ? 'environment' : 'user';
+    startCamera();
+  };
+
+  // ---------- Recording ----------
+  let recorder = null, chunks = [], recStart = 0, timerId = null, countdownTimer = null;
+
+  function pickMime() {
+    if (!window.MediaRecorder) return null;
+    const types = ['video/mp4;codecs=avc1,mp4a.40.2', 'video/mp4', 'video/webm;codecs=vp9,opus', 'video/webm'];
+    return types.find((t) => MediaRecorder.isTypeSupported(t)) || '';
+  }
+
+  $('#btnRec').onclick = () => {
+    if (recorder) { stopRecording(); return; }
+    if (countdownTimer) { cancelCountdown(); return; }
+    if (!stream) { startCamera(); return; }
+    if (state.countdown) runCountdown(); else startRecording();
+  };
+
+  function runCountdown() {
+    let n = 3;
+    const box = $('#count');
+    const show = () => { box.innerHTML = `<span>${n}</span>`; };
+    box.hidden = false; show();
+    countdownTimer = setInterval(() => {
+      n -= 1;
+      if (n > 0) { show(); return; }
+      cancelCountdown();
+      startRecording();
+    }, 1000);
+  }
+  function cancelCountdown() { clearInterval(countdownTimer); countdownTimer = null; $('#count').hidden = true; }
+
+  function startRecording() {
+    const mime = pickMime();
+    if (mime === null) { toast('Запись видео в этом браузере не поддерживается.'); return; }
+    chunks = [];
+    const opts = { videoBitsPerSecond: 8000000 };
+    if (hasAudio) opts.audioBitsPerSecond = 128000;
+    if (mime) opts.mimeType = mime;
+    try { recorder = new MediaRecorder(stream, opts); }
+    catch { recorder = new MediaRecorder(stream); }
+    recorder.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+    recorder.onstop = finishRecording;
+    recorder.start();
+    recStart = Date.now();
+    document.body.classList.add('recording');
+    $('#btnFlip').disabled = true;
+    $('#timer').hidden = false;
+    updateTimer();
+    timerId = setInterval(updateTimer, 500);
+    setPlaying(true);
+    requestWakeLock();
+  }
+
+  function stopRecording() {
+    if (recorder && recorder.state !== 'inactive') recorder.stop();
+    setPlaying(false);
+  }
+
+  function updateTimer() {
+    const s = Math.floor((Date.now() - recStart) / 1000);
+    $('#timerVal').textContent = String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
+  }
+
+  async function finishRecording() {
+    const type = (recorder && recorder.mimeType) || 'video/mp4';
+    recorder = null;
+    clearInterval(timerId);
+    document.body.classList.remove('recording');
+    $('#btnFlip').disabled = false;
+    $('#timer').hidden = true;
+    if (!chunks.length) { toast('Запись получилась пустой. Попробуй ещё раз.'); return; }
+    const blob = new Blob(chunks, { type });
+    chunks = [];
+    const created = Date.now();
+    const item = { id: created, name: `Video_${stamp(new Date(created))}.${type.includes('mp4') ? 'mp4' : 'webm'}`, type, created, size: blob.size, blob };
+    try { await db.put(item); } catch { toast('Не удалось сохранить запись в приложении. Сохрани её сразу.'); }
+    openReview(item);
+  }
+
+  function stamp(d) {
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}`;
+  }
+
+  // ---------- Storage of recordings (IndexedDB) ----------
+  const db = (() => {
+    let dbp;
+    const open = () => dbp || (dbp = new Promise((res, rej) => {
+      const r = indexedDB.open('teleprompter', 1);
+      r.onupgradeneeded = () => r.result.createObjectStore('videos', { keyPath: 'id' });
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => rej(r.error);
+    }));
+    const run = (mode, fn) => open().then((d) => new Promise((res, rej) => {
+      const tx = d.transaction('videos', mode);
+      const req = fn(tx.objectStore('videos'));
+      tx.oncomplete = () => res(req && req.result);
+      tx.onerror = () => rej(tx.error);
+    }));
+    return {
+      put: (item) => run('readwrite', (s) => s.put(item)),
+      del: (id) => run('readwrite', (s) => s.delete(id)),
+      all: () => run('readonly', (s) => s.getAll()),
+    };
+  })();
+
+  // ---------- Review ----------
+  let current = null, currentUrl = null, deleteArmed = false;
+  const reviewVideo = $('#reviewVideo');
+
+  function openReview(item) {
+    current = item;
+    currentUrl = URL.createObjectURL(item.blob);
+    reviewVideo.src = currentUrl;
+    deleteArmed = false;
+    $('#btnDelete').textContent = 'Удалить';
+    openSheet('#reviewSheet');
+  }
+  function closeReview() {
+    reviewVideo.pause();
+    reviewVideo.removeAttribute('src');
+    reviewVideo.load();
+    if (currentUrl) URL.revokeObjectURL(currentUrl);
+    current = null; currentUrl = null;
+    if (!$('#recsSheet').hidden) renderRecs();
+  }
+
+  $('#btnShare').onclick = async () => {
+    if (!current) return;
+    const file = new File([current.blob], current.name, { type: current.type });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      try { await navigator.share({ files: [file] }); }
+      catch (e) { if (e.name !== 'AbortError') toast('Не получилось открыть меню «Поделиться».'); }
+    } else {
+      const a = document.createElement('a');
+      a.href = currentUrl; a.download = current.name;
+      document.body.appendChild(a); a.click(); a.remove();
+    }
+  };
+
+  $('#btnDelete').onclick = async () => {
+    if (!current) return;
+    if (!deleteArmed) { deleteArmed = true; $('#btnDelete').textContent = 'Точно удалить?'; return; }
+    try { await db.del(current.id); } catch {}
+    closeSheet($('#reviewSheet'));
+    toast('Видео удалено');
+  };
+
+  // ---------- Recordings list ----------
+  async function renderRecs() {
+    const list = $('#recsList');
+    let items = [];
+    try { items = await db.all(); } catch {}
+    items.sort((a, b) => b.created - a.created);
+    list.innerHTML = '';
+    if (!items.length) { list.innerHTML = '<p class="empty">Пока нет записей</p>'; return; }
+    for (const it of items) {
+      const b = document.createElement('button');
+      b.type = 'button'; b.className = 'item';
+      const date = new Date(it.created).toLocaleString('ru-RU', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+      const mb = (it.size / 1048576).toFixed(1).replace('.', ',');
+      b.innerHTML = `<span><b></b><small></small></span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg>`;
+      b.querySelector('b').textContent = date;
+      b.querySelector('small').textContent = `${mb} МБ`;
+      b.onclick = () => { closeSheet($('#recsSheet')); openReview(it); };
+      list.appendChild(b);
+    }
+  }
+  $('#btnRecs').onclick = () => { renderRecs(); openSheet('#recsSheet'); };
+
+  // ---------- Screen awake & lifecycle ----------
+  let wakeLock = null;
+  async function requestWakeLock() {
+    try { if ('wakeLock' in navigator && document.visibilityState === 'visible') wakeLock = await navigator.wakeLock.request('screen'); } catch {}
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      requestWakeLock();
+      if (!stream || stream.getVideoTracks().every((t) => t.readyState === 'ended')) startCamera();
+    } else if (recorder) {
+      stopRecording();
+    }
+  });
+
+  if ('serviceWorker' in navigator && location.protocol === 'https:') {
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+  }
+
+  applySettings();
+  startCamera();
+  requestWakeLock();
+})();
+</script>
+</body>
+</html>
