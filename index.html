@@ -295,7 +295,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
 (() => {
   const $ = (s) => document.querySelector(s);
   // Bump on every release: shown in Settings and in the report, so it's clear which copy the phone runs.
-  const APP_VERSION = 9;
+  const APP_VERSION = 10;
 
   // ---------- Settings storage ----------
   const store = {
@@ -790,21 +790,35 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
       });
     }
 
-    // Video: one VideoFrame per painted camera frame, a key frame every 2 seconds.
-    let handle = 0;
+    // Video: one frame per painted camera frame, a key frame every 2 seconds. On the iPhone a VideoFrame
+    // taken straight from the <video> is the sensor's landscape image with a rotation flag, so each frame
+    // is first drawn onto a canvas the size of the picture on screen, which comes out upright.
+    try {
+      const probe = new VideoFrame(cam);
+      dlog(`camera frame: display ${probe.displayWidth}x${probe.displayHeight}, coded ${probe.codedWidth}x${probe.codedHeight}, rotation ${probe.rotation}, flip ${probe.flip}`);
+      probe.close();
+    } catch (e) { dlog('camera frame probe failed: ' + e.message); }
+    const canvas = 'OffscreenCanvas' in window ? new OffscreenCanvas(width, height) : Object.assign(document.createElement('canvas'), { width, height });
+    const ctx = canvas.getContext('2d');
+    let handle = 0, firstDropReason = null;
+    const drop = (reason) => { dropped++; if (!firstDropReason) { firstDropReason = reason; dlog('frame dropped: ' + reason); } };
     const onFrame = (now) => {
       if (!active) return;
       handle = cam.requestVideoFrameCallback(onFrame);
       const ts = Math.round((now - t0) * 1000);
       if (ts < 0) return;
-      if (venc.encodeQueueSize > 4) { dropped++; return; }
+      if (venc.encodeQueueSize > 4) { drop('encoder busy'); return; }
       let frame;
-      try { frame = new VideoFrame(cam, { timestamp: ts }); } catch (e) { dropped++; return; }
-      if (frame.displayWidth !== width || frame.displayHeight !== height) { frame.close(); dropped++; return; }
-      venc.encode(frame, { keyFrame: frames % 60 === 0 });
+      try {
+        ctx.drawImage(cam, 0, 0, width, height);
+        frame = new VideoFrame(canvas, { timestamp: ts });
+      } catch (e) { drop('VideoFrame: ' + e.message); return; }
+      try {
+        venc.encode(frame, { keyFrame: frames % 60 === 0 });
+        frames++;
+        framesEncoded++;
+      } catch (e) { drop('encode: ' + e.message); }
       frame.close();
-      frames++;
-      framesEncoded++;
     };
     handle = cam.requestVideoFrameCallback(onFrame);
 
