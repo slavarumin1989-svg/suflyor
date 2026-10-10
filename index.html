@@ -298,7 +298,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
 (() => {
   const $ = (s) => document.querySelector(s);
   // Bump on every release: shown in Settings and in the report, so it's clear which copy the phone runs.
-  const APP_VERSION = 12;
+  const APP_VERSION = 13;
 
   // ---------- Settings storage ----------
   const store = {
@@ -665,6 +665,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
   // loses the picture after ~15-20 s while the sound goes on (WebKit bug 299164).
   let recorder = null, recStart = 0, timerId = null, countdownTimer = null, starting = false;
   let audioCtx = null, tapLoaded = false, framesEncoded = 0;
+  const av = { videoLag: NaN, captureTime: false, audioDrift: NaN, audioGaps: 0 };
 
   function pickMime() {
     if (!window.MediaRecorder) return null;
@@ -785,9 +786,11 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
 
     const t0 = performance.now();
     let active = true, frames = 0, dropped = 0;
+    Object.assign(av, { videoLag: NaN, captureTime: false, audioDrift: NaN, audioGaps: 0 });
 
     // Audio: timestamps follow the sample count from the moment the first block arrived.
-    let stopTap = null, firstBlockAt = null, samplesSent = 0, pending = [], pendingLen = 0;
+    let stopTap = null, firstBlockAt = null, samplesSent = 0, samplesReceived = 0, pending = [], pendingLen = 0;
+    let driftMin = Infinity, driftWindowAt = null;
     const sr = aconfig ? aconfig.sampleRate : 0;
     const flushAudio = () => {
       if (!pendingLen) return;
@@ -805,7 +808,21 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     if (aenc) {
       stopTap = await tapAudio(micTrack, (block) => {
         if (!active) return;
-        if (firstBlockAt === null) firstBlockAt = performance.now() - block.length / sr * 1000;
+        const arrivedAt = performance.now() - block.length / sr * 1000;
+        if (firstBlockAt === null) firstBlockAt = arrivedAt;
+        // How far the sample clock has fallen behind the wall clock. Blocks can arrive late in bursts when
+        // the page is busy, so only the smallest lag over a whole second counts: if even that is above
+        // 150 ms, samples went missing (an audio dropout) and the timeline is moved forward to match.
+        const drift = arrivedAt - (firstBlockAt + samplesReceived / sr * 1000);
+        driftMin = Math.min(driftMin, drift);
+        if (driftWindowAt === null) driftWindowAt = arrivedAt;
+        if (arrivedAt - driftWindowAt >= 1000) {
+          av.audioDrift = driftMin;
+          if (driftMin > 150) { firstBlockAt += driftMin; av.audioGaps++; dlog(`audio gap ${Math.round(driftMin)} ms closed`); }
+          driftWindowAt = arrivedAt;
+          driftMin = Infinity;
+        }
+        samplesReceived += block.length;
         pending.push(block);
         pendingLen += block.length;
         if (pendingLen >= 2048) flushAudio();
@@ -824,11 +841,20 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     const ctx = canvas.getContext('2d');
     let handle = 0, firstDropReason = null;
     const drop = (reason) => { dropped++; if (!firstDropReason) { firstDropReason = reason; dlog('frame dropped: ' + reason); } };
-    const onFrame = (now) => {
+    // Frames are stamped with the moment the camera captured them (rVFC captureTime) when Safari gives
+    // it; the paint time `now` comes later by the camera-to-screen delay and would put the picture behind
+    // the sound.
+    let lastTs = -1;
+    const onFrame = (now, md) => {
       if (!active) return;
       handle = cam.requestVideoFrameCallback(onFrame);
-      const ts = Math.round((now - t0) * 1000);
+      let at = now;
+      const lag = md && md.captureTime ? now - md.captureTime : NaN;
+      if (lag > 0 && lag < 500) { at = md.captureTime; av.videoLag = lag; av.captureTime = true; }
+      let ts = Math.round((at - t0) * 1000);
       if (ts < 0) return;
+      if (ts <= lastTs) ts = lastTs + 1000;
+      lastTs = ts;
       if (venc.encodeQueueSize > 4) { drop('encoder busy'); return; }
       let frame;
       try {
@@ -1203,7 +1229,8 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     const line = `fps=${framesShown - lastSample.shown} enc=${framesEncoded - lastSample.encoded}` +
       ` t=${cam.currentTime.toFixed(1)} vtrack=${vt ? vt.readyState + (vt.muted ? '/muted' : '') : '-'}` +
       ` atrack=${at ? at.readyState + (at.muted ? '/muted' : '') : '-'} video=${cam.paused ? 'paused' : 'play'}/${cam.readyState}` +
-      ` rec=${recorder ? recorder.state : '-'} offset=${Math.round(offset)}/${Math.round(contentH)}`;
+      ` rec=${recorder ? recorder.state : '-'} offset=${Math.round(offset)}/${Math.round(contentH)}` +
+      (recorder ? ` vlag=${Math.round(av.videoLag)}ms${av.captureTime ? '' : '(no captureTime)'} adrift=${Math.round(av.audioDrift)}ms gaps=${av.audioGaps}` : '');
     lastSample = { shown: framesShown, encoded: framesEncoded };
     dlog(line);
     if (diagOn) $('#diag').textContent = line.split(' ').join('\n');
