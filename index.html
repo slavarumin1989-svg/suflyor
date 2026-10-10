@@ -16,7 +16,7 @@
 :root {
   --ink: #ffffff;
   --muted: rgba(235, 235, 245, 0.6);
-  --glass: rgba(0, 0, 0, 0.42);
+  --glass: rgba(0, 0, 0, 0.5);
   --chip: rgba(255, 255, 255, 0.16);
   --accent: #ffd60a;
   --rec: #ff3b30;
@@ -44,7 +44,7 @@ svg { width: 22px; height: 22px; display: block; }
 }
 
 .top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.pill { display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; border-radius: 999px; background: var(--glass); font-size: 15px; font-weight: 600; -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; border-radius: 999px; background: var(--glass); font-size: 15px; font-weight: 600; }
 .pill svg { width: 18px; height: 18px; }
 .timer { display: inline-flex; align-items: center; gap: 8px; padding: 8px 14px; border-radius: 999px; background: var(--glass); font-weight: 600; font-variant-numeric: tabular-nums; }
 .timer .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--rec); animation: blink 1s steps(2) infinite; }
@@ -66,7 +66,6 @@ body.recording .top .pill { opacity: 0.35; pointer-events: none; }
 .controls {
   display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 14px 10px;
   padding: 12px 18px; border-radius: 24px; background: var(--glass);
-  -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px);
 }
 .speed { order: -1; flex: 1 1 100%; display: flex; align-items: center; gap: 12px; font-size: 14px; }
 .speed label { color: var(--muted); }
@@ -305,14 +304,23 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
 
   function applySettings() {
     textEl.textContent = state.script.trim() ? state.script : 'Нажми «Текст», чтобы добавить сценарий';
-    root.style.setProperty('--fs', state.fontSize + 'px');
-    root.style.setProperty('--dim', state.dim);
-    for (const id of ['speed', 'speed2']) $('#' + id).value = state.speed;
-    $('#speedVal').textContent = $('#speed2Val').textContent = Math.round(state.speed);
-    $('#fontSize').value = state.fontSize; $('#fontSizeVal').textContent = state.fontSize;
-    $('#dim').value = state.dim; $('#dimVal').textContent = Math.round(state.dim * 100) + '%';
+    applyLook();
+    showSpeed();
     $('#countdown').checked = state.countdown;
     measure();
+  }
+
+  // Slider handlers touch only what they change, so dragging stays light while the camera runs.
+  function showSpeed() {
+    for (const id of ['speed', 'speed2']) $('#' + id).value = state.speed;
+    $('#speedVal').textContent = $('#speed2Val').textContent = Math.round(state.speed);
+  }
+
+  function applyLook() {
+    root.style.setProperty('--fs', state.fontSize + 'px');
+    root.style.setProperty('--dim', state.dim);
+    $('#fontSize').value = state.fontSize; $('#fontSizeVal').textContent = state.fontSize;
+    $('#dim').value = state.dim; $('#dimVal').textContent = Math.round(state.dim * 100) + '%';
   }
 
   // ---------- Prompter ----------
@@ -373,11 +381,14 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
   $('#btnPlay').onclick = () => setPlaying(!playing);
   $('#btnReset').onclick = () => { offset = 0; render(); };
 
-  const onSpeed = (e) => { state.speed = +e.target.value; store.set('speed', state.speed); applySettings(); };
-  $('#speed').oninput = onSpeed;
-  $('#speed2').oninput = onSpeed;
-  $('#fontSize').oninput = (e) => { state.fontSize = +e.target.value; store.set('fontSize', state.fontSize); applySettings(); };
-  $('#dim').oninput = (e) => { state.dim = +e.target.value; store.set('dim', state.dim); applySettings(); };
+  for (const id of ['speed', 'speed2']) {
+    $('#' + id).oninput = (e) => { state.speed = +e.target.value; showSpeed(); };
+    $('#' + id).onchange = () => store.set('speed', state.speed);
+  }
+  $('#fontSize').oninput = (e) => { state.fontSize = +e.target.value; applyLook(); measure(); };
+  $('#fontSize').onchange = () => store.set('fontSize', state.fontSize);
+  $('#dim').oninput = (e) => { state.dim = +e.target.value; applyLook(); };
+  $('#dim').onchange = () => store.set('dim', state.dim);
   $('#countdown').onchange = (e) => { state.countdown = e.target.checked; store.set('countdown', state.countdown); };
 
   // ---------- Sheets ----------
@@ -454,8 +465,26 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     }
     cam.srcObject = stream;
     cam.classList.toggle('mirror', facing === 'user');
+    stream.getVideoTracks().forEach((t) => { t.onended = () => { if (!recorder) startCamera(); }; });
+    lastFrameTime = -1; stalledFor = 0;
     try { await cam.play(); } catch {}
   }
+
+  // Watchdog: if the picture stops moving, resume it, and restart the camera when that doesn't help.
+  let lastFrameTime = -1, stalledFor = 0, restarting = false;
+  cam.addEventListener('pause', () => { if (stream) cam.play().catch(() => {}); });
+  setInterval(async () => {
+    if (!stream || restarting || document.visibilityState !== 'visible') return;
+    const t = cam.currentTime;
+    stalledFor = t === lastFrameTime ? stalledFor + 1 : 0;
+    lastFrameTime = t;
+    if (stalledFor === 2) cam.play().catch(() => {});
+    if (stalledFor >= 4 && !recorder) {
+      restarting = true;
+      await startCamera();
+      restarting = false;
+    }
+  }, 1000);
 
   function showNotice(text) { $('#noticeText').textContent = text; $('#notice').hidden = false; }
   $('#btnRetry').onclick = startCamera;
