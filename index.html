@@ -68,9 +68,14 @@ body.recording .top .pill { opacity: 0.35; pointer-events: none; }
   padding: 12px 18px; border-radius: 24px; background: var(--glass);
 }
 .speed { order: -1; flex: 1 1 100%; display: flex; align-items: center; gap: 12px; font-size: 14px; }
-.speed label { color: var(--muted); }
+.speed .label { color: var(--muted); }
 .speed output { width: 34px; text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
-input[type=range] { flex: 1; min-width: 0; accent-color: var(--accent); height: 28px; }
+.slider { position: relative; flex: 1; min-width: 0; height: 32px; touch-action: none; cursor: pointer; }
+.slider .rail { position: absolute; left: 0; right: 0; top: 50%; height: 4px; margin-top: -2px; border-radius: 2px; background: rgba(255,255,255,0.3); overflow: hidden; }
+.slider .fill { height: 100%; background: var(--accent); }
+.slider .thumb { position: absolute; top: 50%; width: 26px; height: 26px; margin: -13px 0 0 -13px; border-radius: 50%; background: #fff; box-shadow: 0 1px 4px rgba(0,0,0,0.4); }
+.slider:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: 6px; }
+.field .slider { flex: none; width: 100%; }
 .round { width: 46px; height: 46px; border-radius: 50%; background: var(--chip); display: grid; place-items: center; }
 .round:disabled { opacity: 0.35; }
 #btnRec { width: 74px; height: 74px; border-radius: 50%; border: 4px solid #fff; display: grid; place-items: center; }
@@ -168,8 +173,8 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
       <svg viewBox="0 0 24 24" fill="currentColor"><path id="playIcon" d="M8 5v14l11-7z"/></svg>
     </button>
     <div class="speed">
-      <label for="speed">Скорость</label>
-      <input type="range" id="speed" min="10" max="200" step="1">
+      <span class="label">Скорость</span>
+      <div class="slider" id="speed" aria-label="Скорость"></div>
       <output id="speedVal" for="speed">40</output>
     </div>
     <button id="btnRec" type="button" aria-label="Запись"><span></span></button>
@@ -219,15 +224,15 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     <div class="sheet-body">
       <div class="field">
         <div class="row"><label for="fontSize">Размер шрифта</label><output id="fontSizeVal"></output></div>
-        <input type="range" id="fontSize" min="16" max="72" step="1">
+        <div class="slider" id="fontSize" aria-label="Размер шрифта"></div>
       </div>
       <div class="field">
         <div class="row"><label for="dim">Затемнение под текстом</label><output id="dimVal"></output></div>
-        <input type="range" id="dim" min="0" max="0.9" step="0.05">
+        <div class="slider" id="dim" aria-label="Затемнение под текстом"></div>
       </div>
       <div class="field">
         <div class="row"><label for="speed2">Скорость прокрутки</label><output id="speed2Val"></output></div>
-        <input type="range" id="speed2" min="10" max="200" step="1">
+        <div class="slider" id="speed2" aria-label="Скорость прокрутки"></div>
       </div>
       <label class="switch" for="countdown">Обратный отсчёт 3 секунды перед записью<input type="checkbox" id="countdown"></label>
       <p class="help">Чтобы открывать Суфлёр как приложение: в Safari нажми «Поделиться» → «На экран Домой». Записи хранятся в самом приложении, пока ты их не удалишь.</p>
@@ -310,17 +315,80 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     measure();
   }
 
-  // Slider handlers touch only what they change, so dragging stays light while the camera runs.
+  // Hand-drawn sliders: iOS Safari can stop painting the camera video while a native range input is dragged.
+  function makeSlider(el, { min, max, step, get, set, commit }) {
+    el.innerHTML = '<div class="rail"><div class="fill"></div></div><div class="thumb"></div>';
+    el.setAttribute('role', 'slider');
+    el.setAttribute('aria-valuemin', min);
+    el.setAttribute('aria-valuemax', max);
+    el.tabIndex = 0;
+    const fill = el.querySelector('.fill'), thumb = el.querySelector('.thumb');
+    const limit = (v) => Math.min(max, Math.max(min, +(Math.round(v / step) * step).toFixed(2)));
+    const fromX = (x) => {
+      const r = el.getBoundingClientRect();
+      return limit(min + (x - r.left) / r.width * (max - min));
+    };
+    let active = false;
+    el.addEventListener('pointerdown', (e) => {
+      active = true;
+      el.setPointerCapture(e.pointerId);
+      set(fromX(e.clientX));
+      e.preventDefault();
+    });
+    const end = () => { if (active) { active = false; commit(); } };
+    el.addEventListener('pointermove', (e) => {
+      if (!active) return;
+      if (e.pointerType === 'mouse' && e.buttons === 0) { end(); return; }
+      set(fromX(e.clientX));
+    });
+    el.addEventListener('pointerup', end);
+    el.addEventListener('pointercancel', end);
+    el.addEventListener('lostpointercapture', end);
+    window.addEventListener('pointerup', end);
+    el.addEventListener('keydown', (e) => {
+      const d = { ArrowRight: step, ArrowUp: step, ArrowLeft: -step, ArrowDown: -step }[e.key];
+      if (!d) return;
+      set(limit(get() + d));
+      commit();
+      e.preventDefault();
+    });
+    return () => {
+      const p = (get() - min) / (max - min) * 100;
+      fill.style.width = p + '%';
+      thumb.style.left = p + '%';
+      el.setAttribute('aria-valuenow', get());
+    };
+  }
+
+  const speedSliders = ['speed', 'speed2'].map((id) => makeSlider($('#' + id), {
+    min: 10, max: 200, step: 1,
+    get: () => state.speed,
+    set: (v) => { state.speed = v; showSpeed(); },
+    commit: () => store.set('speed', state.speed),
+  }));
+  const paintFont = makeSlider($('#fontSize'), {
+    min: 16, max: 72, step: 1,
+    get: () => state.fontSize,
+    set: (v) => { state.fontSize = v; applyLook(); measure(); },
+    commit: () => store.set('fontSize', state.fontSize),
+  });
+  const paintDim = makeSlider($('#dim'), {
+    min: 0, max: 0.9, step: 0.05,
+    get: () => state.dim,
+    set: (v) => { state.dim = v; applyLook(); },
+    commit: () => store.set('dim', state.dim),
+  });
+
   function showSpeed() {
-    for (const id of ['speed', 'speed2']) $('#' + id).value = state.speed;
+    speedSliders.forEach((paint) => paint());
     $('#speedVal').textContent = $('#speed2Val').textContent = Math.round(state.speed);
   }
 
   function applyLook() {
     root.style.setProperty('--fs', state.fontSize + 'px');
     root.style.setProperty('--dim', state.dim);
-    $('#fontSize').value = state.fontSize; $('#fontSizeVal').textContent = state.fontSize;
-    $('#dim').value = state.dim; $('#dimVal').textContent = Math.round(state.dim * 100) + '%';
+    paintFont(); $('#fontSizeVal').textContent = state.fontSize;
+    paintDim(); $('#dimVal').textContent = Math.round(state.dim * 100) + '%';
   }
 
   // ---------- Prompter ----------
@@ -381,14 +449,6 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
   $('#btnPlay').onclick = () => setPlaying(!playing);
   $('#btnReset').onclick = () => { offset = 0; render(); };
 
-  for (const id of ['speed', 'speed2']) {
-    $('#' + id).oninput = (e) => { state.speed = +e.target.value; showSpeed(); };
-    $('#' + id).onchange = () => store.set('speed', state.speed);
-  }
-  $('#fontSize').oninput = (e) => { state.fontSize = +e.target.value; applyLook(); measure(); };
-  $('#fontSize').onchange = () => store.set('fontSize', state.fontSize);
-  $('#dim').oninput = (e) => { state.dim = +e.target.value; applyLook(); };
-  $('#dim').onchange = () => store.set('dim', state.dim);
   $('#countdown').onchange = (e) => { state.countdown = e.target.checked; store.set('countdown', state.countdown); };
 
   // ---------- Sheets ----------
@@ -466,25 +526,53 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     cam.srcObject = stream;
     cam.classList.toggle('mirror', facing === 'user');
     stream.getVideoTracks().forEach((t) => { t.onended = () => { if (!recorder) startCamera(); }; });
-    lastFrameTime = -1; stalledFor = 0;
+    lastFrameAt = performance.now(); stalledChecks = 0;
+    watchFrames();
     try { await cam.play(); } catch {}
   }
 
-  // Watchdog: if the picture stops moving, resume it, and restart the camera when that doesn't help.
-  let lastFrameTime = -1, stalledFor = 0, restarting = false;
+  // Watchdog. requestVideoFrameCallback fires only when a frame is actually painted, so it catches
+  // a picture that froze on screen while the camera keeps running. First re-attach the stream to the
+  // <video> (recording is untouched), and restart the camera only when not recording.
+  let lastFrameAt = performance.now(), stalledChecks = 0, restarting = false;
+  const canWatchFrames = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
+  let frameHandle = 0;
+  function watchFrames() {
+    if (!canWatchFrames) return;
+    if (frameHandle) cam.cancelVideoFrameCallback(frameHandle);
+    const onFrame = () => { lastFrameAt = performance.now(); frameHandle = cam.requestVideoFrameCallback(onFrame); };
+    frameHandle = cam.requestVideoFrameCallback(onFrame);
+  }
+  if (!canWatchFrames) {
+    let lastTime = -1;
+    setInterval(() => { if (cam.currentTime !== lastTime) { lastTime = cam.currentTime; lastFrameAt = performance.now(); } }, 250);
+  }
+
+  async function reviveVideo() {
+    if (!stream) return;
+    cam.srcObject = null;
+    cam.srcObject = stream;
+    lastFrameAt = performance.now();
+    watchFrames();
+    try { await cam.play(); } catch {}
+  }
+
   cam.addEventListener('pause', () => { if (stream) cam.play().catch(() => {}); });
   setInterval(async () => {
     if (!stream || restarting || document.visibilityState !== 'visible') return;
-    const t = cam.currentTime;
-    stalledFor = t === lastFrameTime ? stalledFor + 1 : 0;
-    lastFrameTime = t;
-    if (stalledFor === 2) cam.play().catch(() => {});
-    if (stalledFor >= 4 && !recorder) {
+    if (performance.now() - lastFrameAt < 1200) { stalledChecks = 0; return; }
+    stalledChecks += 1;
+    if (stalledChecks <= 2 || recorder) {
+      await reviveVideo();
+    } else {
       restarting = true;
       await startCamera();
       restarting = false;
     }
   }, 1000);
+
+  // A tap on the open camera area also wakes the picture up.
+  document.querySelector('.spacer').addEventListener('click', reviveVideo);
 
   function showNotice(text) { $('#noticeText').textContent = text; $('#notice').hidden = false; }
   $('#btnRetry').onclick = startCamera;
