@@ -298,7 +298,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
 (() => {
   const $ = (s) => document.querySelector(s);
   // Bump on every release: shown in Settings and in the report, so it's clear which copy the phone runs.
-  const APP_VERSION = 13;
+  const APP_VERSION = 14;
 
   // ---------- Settings storage ----------
   const store = {
@@ -716,6 +716,149 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     return () => { proc.onaudioprocess = null; source.disconnect(); proc.disconnect(); silent.disconnect(); };
   }
 
+  // Reads the AAC track out of an MP4 (plain or fragmented, as Safari's MediaRecorder writes it):
+  // sample positions, decode times and durations in the track timescale, plus the AudioSpecificConfig.
+  function readAacFromMp4(buffer) {
+    const u8 = new Uint8Array(buffer), v = new DataView(buffer);
+    const type = (p) => String.fromCharCode(u8[p + 4], u8[p + 5], u8[p + 6], u8[p + 7]);
+    const u64 = (p) => v.getUint32(p) * 2 ** 32 + v.getUint32(p + 4);
+    const children = (start, end, fn) => {
+      for (let p = start; p + 8 <= end;) {
+        let size = v.getUint32(p), header = 8;
+        if (size === 1) { size = u64(p + 8); header = 16; } else if (size === 0) size = end - p;
+        if (size < header) break;
+        fn(type(p), p, p + header, Math.min(end, p + size));
+        p += size;
+      }
+    };
+    const descLen = (p) => { let len = 0; for (let i = 0; i < 4; i++) { const b = u8[p++]; len = (len << 7) | (b & 0x7f); if (!(b & 0x80)) break; } return [len, p]; };
+    const findAsc = (p, end) => {
+      while (p < end) {
+        const tag = u8[p++];
+        let len; [len, p] = descLen(p);
+        if (tag === 0x03) {
+          const flags = u8[p + 2];
+          let q = p + 3;
+          if (flags & 0x80) q += 2;
+          if (flags & 0x40) q += 1 + u8[q];
+          if (flags & 0x20) q += 2;
+          return findAsc(q, p + len);
+        }
+        if (tag === 0x04) return findAsc(p + 13, p + len);
+        if (tag === 0x05) return u8.slice(p, p + len);
+        p += len;
+      }
+      return null;
+    };
+
+    const t = { timescale: 0, sampleRate: 0, channels: 0, asc: null, stts: [], sizes: [], stsc: [], chunkOffsets: [], trexDuration: 0, trexSize: 0 };
+    let soundTrackId = 0;
+    const samples = [];
+    children(0, u8.length, (bt, _, body, end) => {
+      if (bt === 'moov') {
+        children(body, end, (mt, __, mbody, mend) => {
+          if (mt === 'mvex') children(mbody, mend, (xt, ___, xb) => { if (xt === 'trex') { t.trexDuration = v.getUint32(xb + 12); t.trexSize = v.getUint32(xb + 16); } });
+          if (mt !== 'trak') return;
+          let id = 0, isSound = false;
+          const tr = { ...t, stts: [], sizes: [], stsc: [], chunkOffsets: [] };
+          const walk = (s, e) => children(s, e, (ct, ___, cb, ce) => {
+            if (ct === 'tkhd') id = v.getUint32(cb + (u8[cb] === 1 ? 20 : 12));
+            if (ct === 'mdhd') tr.timescale = v.getUint32(cb + (u8[cb] === 1 ? 20 : 12));
+            if (ct === 'hdlr') isSound = String.fromCharCode(u8[cb + 8], u8[cb + 9], u8[cb + 10], u8[cb + 11]) === 'soun';
+            if (['mdia', 'minf', 'stbl'].includes(ct)) walk(cb, ce);
+            if (ct === 'stsd') walk(cb + 8, ce);
+            if (ct === 'mp4a') { tr.channels = v.getUint16(cb + 16); tr.sampleRate = v.getUint32(cb + 24) >>> 16; walk(cb + 28, ce); }
+            if (ct === 'esds') tr.asc = findAsc(cb + 4, ce);
+            if (ct === 'stts') { const n = v.getUint32(cb + 4); for (let i = 0; i < n; i++) tr.stts.push([v.getUint32(cb + 8 + i * 8), v.getUint32(cb + 12 + i * 8)]); }
+            if (ct === 'stsz') { const fixed = v.getUint32(cb + 4), n = v.getUint32(cb + 8); for (let i = 0; i < n; i++) tr.sizes.push(fixed || v.getUint32(cb + 12 + i * 4)); }
+            if (ct === 'stsc') { const n = v.getUint32(cb + 4); for (let i = 0; i < n; i++) tr.stsc.push([v.getUint32(cb + 8 + i * 12), v.getUint32(cb + 12 + i * 12)]); }
+            if (ct === 'stco') { const n = v.getUint32(cb + 4); for (let i = 0; i < n; i++) tr.chunkOffsets.push(v.getUint32(cb + 8 + i * 4)); }
+            if (ct === 'co64') { const n = v.getUint32(cb + 4); for (let i = 0; i < n; i++) tr.chunkOffsets.push(u64(cb + 8 + i * 8)); }
+          });
+          walk(mbody, mend);
+          if (isSound && !soundTrackId) { soundTrackId = id; Object.assign(t, tr, { trexDuration: t.trexDuration, trexSize: t.trexSize }); }
+        });
+        // Plain MP4: samples come from the sample tables.
+        if (t.sizes.length && t.chunkOffsets.length) {
+          let s = 0, dts = 0, sttsI = 0, sttsLeft = t.stts.length ? t.stts[0][0] : 0;
+          for (let c = 0; c < t.chunkOffsets.length && s < t.sizes.length; c++) {
+            let run = t.stsc[0] ? t.stsc[0][1] : 1;
+            for (const [first, per] of t.stsc) if (c + 1 >= first) run = per;
+            let off = t.chunkOffsets[c];
+            for (let k = 0; k < run && s < t.sizes.length; k++, s++) {
+              while (sttsLeft === 0 && sttsI + 1 < t.stts.length) sttsLeft = t.stts[++sttsI][0];
+              const dur = t.stts[sttsI] ? t.stts[sttsI][1] : 1024;
+              samples.push({ offset: off, size: t.sizes[s], dts, dur });
+              off += t.sizes[s]; dts += dur; sttsLeft--;
+            }
+          }
+        }
+      }
+      if (bt === 'moof') {
+        const moofStart = body - 8;
+        children(body, end, (ft, __, fb, fe) => {
+          if (ft !== 'traf') return;
+          let trackId = 0, base = moofStart, defDur = t.trexDuration, defSize = t.trexSize, dts = null, pos = null;
+          children(fb, fe, (rt, ___, rb) => {
+            const flags = v.getUint32(rb) & 0xffffff;
+            if (rt === 'tfhd') {
+              trackId = v.getUint32(rb + 4);
+              let q = rb + 8;
+              if (flags & 0x1) { base = u64(q); q += 8; }
+              if (flags & 0x2) q += 4;
+              if (flags & 0x8) { defDur = v.getUint32(q); q += 4; }
+              if (flags & 0x10) { defSize = v.getUint32(q); q += 4; }
+            }
+            if (rt === 'tfdt') dts = u8[rb] === 1 ? u64(rb + 4) : v.getUint32(rb + 4);
+            if (rt === 'trun' && (!soundTrackId || trackId === soundTrackId)) {
+              const count = v.getUint32(rb + 4);
+              let q = rb + 8;
+              if (flags & 0x1) { pos = base + v.getInt32(q); q += 4; } else if (pos === null) pos = base;
+              if (flags & 0x4) q += 4;
+              if (dts === null) dts = samples.length ? samples[samples.length - 1].dts + samples[samples.length - 1].dur : 0;
+              for (let i = 0; i < count; i++) {
+                let dur = defDur, size = defSize;
+                if (flags & 0x100) { dur = v.getUint32(q); q += 4; }
+                if (flags & 0x200) { size = v.getUint32(q); q += 4; }
+                if (flags & 0x400) q += 4;
+                if (flags & 0x800) q += 4;
+                samples.push({ offset: pos, size, dts, dur });
+                pos += size; dts += dur;
+              }
+            }
+          });
+        });
+      }
+    });
+    if (t.asc && t.asc.length >= 2) {
+      const rates = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
+      const idx = ((t.asc[0] & 7) << 1) | (t.asc[1] >> 7);
+      if (rates[idx]) t.sampleRate = rates[idx];
+      t.channels = (t.asc[1] >> 3) & 0xf || t.channels;
+    }
+    return { timescale: t.timescale || t.sampleRate, sampleRate: t.sampleRate, channels: t.channels || 1, asc: t.asc, samples: samples.filter((s) => s.size > 0 && s.offset + s.size <= u8.length), bytes: u8 };
+  }
+
+  // Sound for our own recorder comes from an audio-only MediaRecorder: Safari keeps its timing right,
+  // while samples pulled through Web Audio arrive ~7% short on the iPhone and the voice runs ahead of
+  // the lips. The video track of Safari's MP4 is what breaks (WebKit bug 299164), the audio track is fine.
+  function startAudioRecorder(track) {
+    if (!window.MediaRecorder) return null;
+    const mime = ['audio/mp4;codecs=mp4a.40.2', 'audio/mp4'].find((m) => MediaRecorder.isTypeSupported(m));
+    if (!mime) { dlog('audio/mp4 MediaRecorder not supported'); return null; }
+    const parts = [];
+    let mr;
+    try { mr = new MediaRecorder(new MediaStream([track]), { mimeType: mime, audioBitsPerSecond: 128000 }); }
+    catch (e) { dlog('audio MediaRecorder failed: ' + e.message); return null; }
+    const rec = { startedAt: null, mime };
+    mr.onstart = () => { rec.startedAt = performance.now(); };
+    mr.ondataavailable = (e) => { if (e.data && e.data.size) parts.push(e.data); };
+    const done = new Promise((resolve) => { mr.onstop = () => resolve(new Blob(parts, { type: mime })); });
+    rec.stop = () => { if (mr.state !== 'inactive') mr.stop(); return done; };
+    mr.start();
+    return rec;
+  }
+
   async function startEncoderRecorder() {
     if (!canEncode()) return null;
     const width = cam.videoWidth, height = cam.videoHeight;
@@ -735,23 +878,15 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     if (micTrack && audioCtx) {
       const cfg = { codec: 'mp4a.40.2', sampleRate: audioCtx.sampleRate, numberOfChannels: 1, bitrate: 128000 };
       const res = await AudioEncoder.isConfigSupported(cfg).catch(() => null);
-      if (res && res.supported) aconfig = cfg; else dlog('AAC encoder not supported, recording without sound');
+      if (res && res.supported) aconfig = cfg; else dlog('AAC encoder not supported');
     }
 
-    const target = new Mp4Muxer.ArrayBufferTarget();
-    const muxer = new Mp4Muxer.Muxer({
-      target,
-      fastStart: 'in-memory',
-      firstTimestampBehavior: 'cross-track-offset',
-      video: { codec: 'avc', width, height },
-      ...(aconfig ? { audio: { codec: 'aac', sampleRate: aconfig.sampleRate, numberOfChannels: 1 } } : {}),
-    });
-
-    // Safari leaves EncodedVideoChunk/EncodedAudioChunk.duration null, which mp4-muxer rejects, so chunks
-    // go in through the raw methods with a fallback duration (the muxer derives the real one from the
-    // next sample's timestamp anyway).
+    // Encoded chunks are kept in memory and the MP4 is put together when recording stops, once it is
+    // known which sound track to use. Safari leaves chunk.duration null, so a default is filled in
+    // (the muxer derives the real duration from the next sample's timestamp anyway).
     const chunkBytes = (chunk) => { const data = new Uint8Array(chunk.byteLength); chunk.copyTo(data); return data; };
-    let failure = null, firstVideoChunk = true;
+    const videoChunks = [], webAudioChunks = [];
+    let videoMeta = null, failure = null;
     const fail = (e) => {
       if (failure) return;
       failure = e;
@@ -760,12 +895,11 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     };
     const venc = new VideoEncoder({
       output: (chunk, meta) => {
-        if (firstVideoChunk) {
-          firstVideoChunk = false;
-          const d = meta && meta.decoderConfig;
-          dlog(`first video chunk: ${chunk.type}, duration ${chunk.duration}, description ${d && d.description ? d.description.byteLength + ' bytes' : 'missing'}`);
+        if (!videoMeta && meta && meta.decoderConfig) {
+          videoMeta = meta;
+          dlog(`first video chunk: ${chunk.type}, description ${meta.decoderConfig.description ? meta.decoderConfig.description.byteLength + ' bytes' : 'missing'}`);
         }
-        try { muxer.addVideoChunkRaw(chunkBytes(chunk), chunk.type, chunk.timestamp, chunk.duration ?? 33333, meta); } catch (e) { fail(e); }
+        videoChunks.push({ data: chunkBytes(chunk), type: chunk.type, ts: chunk.timestamp, dur: chunk.duration ?? 33333 });
       },
       error: (e) => fail(e),
     });
@@ -774,12 +908,8 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     let aenc = null;
     if (aconfig) {
       aenc = new AudioEncoder({
-        // Safari's AAC decoderConfig.description is a whole esds box instead of an AudioSpecificConfig
-        // (WebKit bug 302253) and would give a silent track, so meta is not passed: the muxer writes its own.
-        output: (chunk) => {
-          try { muxer.addAudioChunkRaw(chunkBytes(chunk), chunk.type, chunk.timestamp, chunk.duration ?? Math.round(1024 / aconfig.sampleRate * 1e6)); } catch (e) { fail(e); }
-        },
-        error: (e) => fail(e),
+        output: (chunk) => webAudioChunks.push({ data: chunkBytes(chunk), ts: chunk.timestamp, dur: chunk.duration ?? Math.round(1024 / aconfig.sampleRate * 1e6) }),
+        error: (e) => dlog('web audio encoder error: ' + e.message),
       });
       aenc.configure(aconfig);
     }
@@ -787,8 +917,10 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     const t0 = performance.now();
     let active = true, frames = 0, dropped = 0;
     Object.assign(av, { videoLag: NaN, captureTime: false, audioDrift: NaN, audioGaps: 0 });
+    const audioRec = micTrack ? startAudioRecorder(micTrack) : null;
 
-    // Audio: timestamps follow the sample count from the moment the first block arrived.
+    // Backup sound through Web Audio, stamped by sample count from the first block. Its drift against
+    // the wall clock is only measured for the report.
     let stopTap = null, firstBlockAt = null, samplesSent = 0, samplesReceived = 0, pending = [], pendingLen = 0;
     let driftMin = Infinity, driftWindowAt = null;
     const sr = aconfig ? aconfig.sampleRate : 0;
@@ -806,31 +938,24 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
       audio.close();
     };
     if (aenc) {
-      stopTap = await tapAudio(micTrack, (block) => {
-        if (!active) return;
-        const arrivedAt = performance.now() - block.length / sr * 1000;
-        if (firstBlockAt === null) firstBlockAt = arrivedAt;
-        // How far the sample clock has fallen behind the wall clock. Blocks can arrive late in bursts when
-        // the page is busy, so only the smallest lag over a whole second counts: if even that is above
-        // 150 ms, samples went missing (an audio dropout) and the timeline is moved forward to match.
-        const drift = arrivedAt - (firstBlockAt + samplesReceived / sr * 1000);
-        driftMin = Math.min(driftMin, drift);
-        if (driftWindowAt === null) driftWindowAt = arrivedAt;
-        if (arrivedAt - driftWindowAt >= 1000) {
-          av.audioDrift = driftMin;
-          if (driftMin > 150) { firstBlockAt += driftMin; av.audioGaps++; dlog(`audio gap ${Math.round(driftMin)} ms closed`); }
-          driftWindowAt = arrivedAt;
-          driftMin = Infinity;
-        }
-        samplesReceived += block.length;
-        pending.push(block);
-        pendingLen += block.length;
-        if (pendingLen >= 2048) flushAudio();
-      });
+      try {
+        stopTap = await tapAudio(micTrack, (block) => {
+          if (!active) return;
+          const arrivedAt = performance.now() - block.length / sr * 1000;
+          if (firstBlockAt === null) firstBlockAt = arrivedAt;
+          driftMin = Math.min(driftMin, arrivedAt - (firstBlockAt + samplesReceived / sr * 1000));
+          if (driftWindowAt === null) driftWindowAt = arrivedAt;
+          if (arrivedAt - driftWindowAt >= 1000) { av.audioDrift = driftMin; driftWindowAt = arrivedAt; driftMin = Infinity; }
+          samplesReceived += block.length;
+          pending.push(block);
+          pendingLen += block.length;
+          if (pendingLen >= 2048) flushAudio();
+        });
+      } catch (e) { dlog('web audio tap failed: ' + e.message); }
     }
 
     // Video: one frame per painted camera frame, a key frame every 2 seconds. On the iPhone a VideoFrame
-    // taken straight from the <video> is the sensor's landscape image with a rotation flag, so each frame
+    // taken straight from the <video> is the sensor's landscape image with no rotation info, so each frame
     // is first drawn onto a canvas the size of the picture on screen, which comes out upright.
     try {
       const probe = new VideoFrame(cam);
@@ -842,8 +967,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     let handle = 0, firstDropReason = null;
     const drop = (reason) => { dropped++; if (!firstDropReason) { firstDropReason = reason; dlog('frame dropped: ' + reason); } };
     // Frames are stamped with the moment the camera captured them (rVFC captureTime) when Safari gives
-    // it; the paint time `now` comes later by the camera-to-screen delay and would put the picture behind
-    // the sound.
+    // it; the paint time `now` comes later by the camera-to-screen delay.
     let lastTs = -1;
     const onFrame = (now, md) => {
       if (!active) return;
@@ -870,22 +994,84 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     };
     handle = cam.requestVideoFrameCallback(onFrame);
 
+    // Picks the sound track: Safari's audio recording if it covers the recording, else the Web Audio one.
+    async function chooseAudio(wallSeconds) {
+      let fromSafari = null, safariSeconds = 0;
+      if (audioRec) {
+        try {
+          const blob = await audioRec.stop();
+          const mp4 = readAacFromMp4(await blob.arrayBuffer());
+          const ts = mp4.timescale || 1;
+          safariSeconds = mp4.samples.reduce((a, s) => a + s.dur, 0) / ts;
+          if (mp4.samples.length && mp4.asc) {
+            const startUs = Math.max(0, ((audioRec.startedAt ?? t0) - t0) * 1000);
+            const firstDts = mp4.samples[0].dts;
+            fromSafari = {
+              source: 'Safari', sampleRate: mp4.sampleRate, channels: mp4.channels, description: mp4.asc,
+              chunks: mp4.samples.map((s) => ({
+                data: mp4.bytes.slice(s.offset, s.offset + s.size),
+                ts: Math.round(startUs + (s.dts - firstDts) / ts * 1e6),
+                dur: Math.round(s.dur / ts * 1e6),
+              })),
+            };
+          }
+          dlog(`Safari audio: ${blob.size} bytes, ${mp4.samples.length} AAC frames, ${safariSeconds.toFixed(1)}s, ${mp4.sampleRate}Hz x${mp4.channels}, start +${Math.round(((audioRec.startedAt ?? t0) - t0))}ms`);
+        } catch (e) { dlog('Safari audio unusable: ' + e.message); }
+      }
+      const webSeconds = samplesSent / (sr || 1);
+      dlog(`sound: Safari ${safariSeconds.toFixed(1)}s, Web Audio ${webSeconds.toFixed(1)}s, recording ${wallSeconds.toFixed(1)}s`);
+      if (fromSafari && safariSeconds > wallSeconds * 0.9) return fromSafari;
+      if (webAudioChunks.length) return { source: 'Web Audio', sampleRate: sr, channels: 1, description: null, chunks: webAudioChunks };
+      return fromSafari;
+    }
+
     return {
-      kind: `own encoder ${vconfig.codec} ${width}x${height}${aenc ? ' + AAC ' + sr + 'Hz' : ' (no sound)'}`,
+      kind: `own encoder ${vconfig.codec} ${width}x${height}`,
       state: 'recording',
       async stop() {
         this.state = 'inactive';
+        const wallSeconds = (performance.now() - t0) / 1000;
         active = false;
         cam.cancelVideoFrameCallback(handle);
         if (stopTap) stopTap();
-        if (aenc) flushAudio();
+        if (aenc && firstBlockAt !== null) flushAudio();
         await venc.flush();
-        if (aenc) await aenc.flush();
+        if (aenc) { await aenc.flush().catch(() => {}); aenc.close(); }
         venc.close();
-        if (aenc) aenc.close();
-        dlog(`encoded ${frames} frames, dropped ${dropped}, audio ${(samplesSent / (sr || 1)).toFixed(1)}s`);
+        const audio = await chooseAudio(wallSeconds);
+        dlog(`encoded ${frames} frames, dropped ${dropped}; sound from ${audio ? audio.source : 'nowhere'}`);
         if (failure) throw failure;
-        if (!frames) throw new Error('no video frames');
+        if (!videoChunks.length || !videoMeta) throw new Error('no video frames');
+
+        // Both tracks on one timeline starting at 0, added in time order (mp4-muxer's cross-track offset
+        // must see the earliest chunk first).
+        const all = videoChunks.map((c) => ({ ...c, video: true }));
+        if (audio) for (const c of audio.chunks) all.push({ ...c, video: false });
+        const zero = Math.min(...all.map((c) => c.ts));
+        all.sort((a, b) => a.ts - b.ts || (a.video ? -1 : 1));
+        const target = new Mp4Muxer.ArrayBufferTarget();
+        const muxer = new Mp4Muxer.Muxer({
+          target,
+          fastStart: 'in-memory',
+          firstTimestampBehavior: 'cross-track-offset',
+          video: { codec: 'avc', width, height },
+          ...(audio ? { audio: { codec: 'aac', sampleRate: audio.sampleRate, numberOfChannels: audio.channels } } : {}),
+        });
+        let firstVideo = true, firstAudio = true;
+        for (const c of all) {
+          if (c.video) {
+            muxer.addVideoChunkRaw(c.data, c.type, c.ts - zero, c.dur, firstVideo ? videoMeta : undefined);
+            firstVideo = false;
+          } else {
+            // The AudioSpecificConfig read from Safari's file is passed on; for Web Audio sound the muxer
+            // writes its own (Safari's AudioEncoder gives a whole esds box there, WebKit bug 302253).
+            const meta = firstAudio && audio.description
+              ? { decoderConfig: { codec: 'mp4a.40.2', sampleRate: audio.sampleRate, numberOfChannels: audio.channels, description: audio.description } }
+              : undefined;
+            muxer.addAudioChunkRaw(c.data, 'key', c.ts - zero, c.dur, meta);
+            firstAudio = false;
+          }
+        }
         muxer.finalize();
         return new Blob([target.buffer], { type: 'video/mp4' });
       },
@@ -1230,7 +1416,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
       ` t=${cam.currentTime.toFixed(1)} vtrack=${vt ? vt.readyState + (vt.muted ? '/muted' : '') : '-'}` +
       ` atrack=${at ? at.readyState + (at.muted ? '/muted' : '') : '-'} video=${cam.paused ? 'paused' : 'play'}/${cam.readyState}` +
       ` rec=${recorder ? recorder.state : '-'} offset=${Math.round(offset)}/${Math.round(contentH)}` +
-      (recorder ? ` vlag=${Math.round(av.videoLag)}ms${av.captureTime ? '' : '(no captureTime)'} adrift=${Math.round(av.audioDrift)}ms gaps=${av.audioGaps}` : '');
+      (recorder ? ` vlag=${Math.round(av.videoLag)}ms${av.captureTime ? '' : '(no captureTime)'} adrift=${Math.round(av.audioDrift)}ms` : '');
     lastSample = { shown: framesShown, encoded: framesEncoded };
     dlog(line);
     if (diagOn) $('#diag').textContent = line.split(' ').join('\n');
