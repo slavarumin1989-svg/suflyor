@@ -129,6 +129,8 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
 .switch { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 15px; }
 .switch input { width: 22px; height: 22px; accent-color: var(--accent); }
 .help { color: var(--muted); font-size: 14px; line-height: 1.5; margin: 0; }
+.update { position: fixed; left: 50%; top: calc(env(safe-area-inset-top, 0px) + 56px); transform: translateX(-50%); z-index: 30; display: flex; align-items: center; gap: 12px; padding: 8px 8px 8px 16px; border-radius: 999px; background: var(--sheet); font-size: 15px; white-space: nowrap; box-shadow: 0 4px 16px rgba(0,0,0,0.4); }
+.update button { padding: 6px 14px; border-radius: 999px; background: var(--accent); color: #000; font-weight: 600; }
 #diag { position: fixed; right: calc(env(safe-area-inset-right, 0px) + 8px); top: calc(env(safe-area-inset-top, 0px) + 52px); z-index: 10; padding: 6px 8px; border-radius: 8px; background: rgba(0,0,0,0.7); font: 11px/1.4 ui-monospace, Menlo, monospace; white-space: pre; pointer-events: none; }
 #reportText { width: 100%; flex: 1; min-height: 200px; resize: none; border: 0; border-radius: 12px; padding: 12px; background: var(--sheet-2); color: var(--ink); font: 11px/1.4 ui-monospace, Menlo, monospace; }
 
@@ -189,6 +191,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
 
 <div id="count" hidden></div>
 <div id="diag" hidden></div>
+<div class="update" id="updateBar" hidden>Вышла новая версия <button type="button" id="btnUpdate">Обновить</button></div>
 
 <div class="backdrop" id="reportSheet" hidden>
   <div class="sheet tall" role="dialog" aria-labelledby="reportTitle">
@@ -295,7 +298,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
 (() => {
   const $ = (s) => document.querySelector(s);
   // Bump on every release: shown in Settings and in the report, so it's clear which copy the phone runs.
-  const APP_VERSION = 11;
+  const APP_VERSION = 12;
 
   // ---------- Settings storage ----------
   const store = {
@@ -1164,8 +1167,22 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
       }
     } catch (e) { dlog('wake lock failed: ' + (e && e.name)); }
   }
+  // The page can stay open in a Safari tab for hours, so a newer release is offered as a one-tap reload.
+  async function checkForUpdate() {
+    if (recorder) return;
+    try {
+      const html = await fetch('./?update-check=' + Date.now(), { cache: 'no-store' }).then((r) => r.text());
+      const m = html.match(/APP_VERSION = (\d+)/);
+      if (m && +m[1] > APP_VERSION) { $('#updateBar').hidden = false; dlog('new version available: ' + m[1]); }
+    } catch {}
+  }
+  $('#btnUpdate').onclick = () => location.reload();
+  setInterval(checkForUpdate, 5 * 60 * 1000);
+  setTimeout(checkForUpdate, 5000);
+
   document.addEventListener('visibilitychange', () => {
     dlog('page ' + document.visibilityState);
+    if (document.visibilityState === 'visible') checkForUpdate();
     if (document.visibilityState === 'visible') {
       requestWakeLock();
       if (!stream || stream.getVideoTracks().every((t) => t.readyState === 'ended')) startCamera();

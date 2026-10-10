@@ -1,4 +1,4 @@
-const CACHE = 'suflyor-v11';
+const CACHE = 'suflyor-v12';
 const ASSETS = ['./', './index.html', './manifest.webmanifest', './icons/icon-180.png', './icons/icon-192.png', './icons/icon-512.png', './vendor/mp4-muxer.min.js'];
 
 self.addEventListener('install', (e) => {
@@ -13,7 +13,8 @@ self.addEventListener('activate', (e) => {
 
 // Network first, so updates arrive; cache as an offline fallback.
 self.addEventListener('fetch', (e) => {
-  if (e.request.method !== 'GET' || new URL(e.request.url).origin !== location.origin) return;
+  const url = new URL(e.request.url);
+  if (e.request.method !== 'GET' || url.origin !== location.origin || url.searchParams.has('update-check')) return;
   e.respondWith(
     // no-cache: always revalidate with GitHub (ETag), so a new release shows up on the next launch
     // instead of after the 10-minute HTTP cache expires.
