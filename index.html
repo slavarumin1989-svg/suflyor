@@ -254,6 +254,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
       <p class="help">Если выключить, запись пойдёт в 720p: файлы будут меньше, а телефон будет меньше греться.</p>
       <label class="switch" for="diagOn">Показывать диагностику на экране<input type="checkbox" id="diagOn"></label>
       <button class="btn wide" id="btnReport" type="button">Отчёт для Claude</button>
+      <p class="help" id="version"></p>
       <p class="help">Чтобы открывать Суфлёр как приложение: в Safari нажми «Поделиться» → «На экран Домой». Записи хранятся в самом приложении, пока ты их не удалишь.</p>
     </div>
   </div>
@@ -292,6 +293,8 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
 <script>
 (() => {
   const $ = (s) => document.querySelector(s);
+  // Bump on every release: shown in Settings and in the report, so it's clear which copy the phone runs.
+  const APP_VERSION = 8;
 
   // ---------- Settings storage ----------
   const store = {
@@ -937,7 +940,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
   });
 
   if ('serviceWorker' in navigator && location.protocol === 'https:') {
-    navigator.serviceWorker.register('sw.js').catch(() => {});
+    navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).then((r) => r.update()).catch(() => {});
   }
 
   // One sample per second: frames painted (fps), video clock, track state.
@@ -959,7 +962,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
 
   function buildReport() {
     return [
-      'Суфлёр — отчёт',
+      'Суфлёр — отчёт, версия ' + APP_VERSION,
       'UA: ' + navigator.userAgent,
       'standalone: ' + (navigator.standalone === true) + ', screen: ' + screen.width + 'x' + screen.height + ', dpr: ' + devicePixelRatio,
       'settings: ' + JSON.stringify({ hd: state.hd, speed: state.speed, fontSize: state.fontSize, countdown: state.countdown }),
@@ -986,6 +989,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
   };
 
   dlog('app start, ' + navigator.userAgent);
+  $('#version').textContent = 'Версия ' + APP_VERSION;
   applySettings();
   showDiag();
   startCamera();
