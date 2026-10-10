@@ -54,8 +54,6 @@ body.recording .top .pill { opacity: 0.35; pointer-events: none; }
 #prompter {
   position: relative; height: 40%; flex: none; overflow: hidden; border-radius: 16px;
   background: rgba(0, 0, 0, var(--dim)); touch-action: none;
-  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 9%, #000 86%, transparent 100%);
-  mask-image: linear-gradient(to bottom, transparent 0, #000 9%, #000 86%, transparent 100%);
 }
 #track { position: absolute; left: 0; right: 0; top: 0; padding: 0 22px 0 28px; will-change: transform; }
 #text { white-space: pre-wrap; word-wrap: break-word; font-size: var(--fs); font-weight: 600; line-height: 1.3; text-shadow: 0 1px 2px rgba(0,0,0,0.5); }
@@ -235,6 +233,8 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
         <div class="slider" id="speed2" aria-label="Скорость прокрутки"></div>
       </div>
       <label class="switch" for="countdown">Обратный отсчёт 3 секунды перед записью<input type="checkbox" id="countdown"></label>
+      <label class="switch" for="hd">Высокое качество 1080p<input type="checkbox" id="hd"></label>
+      <p class="help">По умолчанию запись идёт в 720p: так она надёжнее. В 1080p на некоторых iPhone камера может останавливаться через несколько секунд записи.</p>
       <p class="help">Чтобы открывать Суфлёр как приложение: в Safari нажми «Поделиться» → «На экран Домой». Записи хранятся в самом приложении, пока ты их не удалишь.</p>
     </div>
   </div>
@@ -302,6 +302,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     fontSize: store.get('fontSize', 30),
     dim: store.get('dim', 0.55),
     countdown: store.get('countdown', true),
+    hd: store.get('hd', false),
   };
 
   const root = document.documentElement;
@@ -312,6 +313,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     applyLook();
     showSpeed();
     $('#countdown').checked = state.countdown;
+    $('#hd').checked = state.hd;
     measure();
   }
 
@@ -450,6 +452,11 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
   $('#btnReset').onclick = () => { offset = 0; render(); };
 
   $('#countdown').onchange = (e) => { state.countdown = e.target.checked; store.set('countdown', state.countdown); };
+  $('#hd').onchange = (e) => {
+    state.hd = e.target.checked;
+    store.set('hd', state.hd);
+    if (!recorder) startCamera();
+  };
 
   // ---------- Sheets ----------
   function openSheet(id) { $(id).hidden = false; }
@@ -509,7 +516,9 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
       showNotice('Этот браузер не даёт доступ к камере. Открой страницу в Safari.');
       return;
     }
-    const video = { facingMode: facing, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } };
+    const video = state.hd
+      ? { facingMode: facing, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } }
+      : { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } };
     try {
       stream = await navigator.mediaDevices.getUserMedia({ video, audio: true });
       hasAudio = true;
@@ -526,27 +535,32 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     cam.srcObject = stream;
     cam.classList.toggle('mirror', facing === 'user');
     stream.getVideoTracks().forEach((t) => { t.onended = () => { if (!recorder) startCamera(); }; });
-    lastFrameAt = performance.now(); stalledChecks = 0;
+    lastFrameAt = performance.now(); stalledChecks = 0; rvfcFrames = 0;
     watchFrames();
     try { await cam.play(); } catch {}
   }
 
-  // Watchdog. requestVideoFrameCallback fires only when a frame is actually painted, so it catches
-  // a picture that froze on screen while the camera keeps running. First re-attach the stream to the
-  // <video> (recording is untouched), and restart the camera only when not recording.
-  let lastFrameAt = performance.now(), stalledChecks = 0, restarting = false;
+  // Watchdog. requestVideoFrameCallback fires when a frame is actually painted; it is trusted only after
+  // it has been seen firing, otherwise the video clock is used. A stalled picture is re-attached to the
+  // <video>, then the camera is restarted. During recording a stall stops the recording (what was
+  // captured is kept), because the iPhone camera does not come back on its own.
+  let lastFrameAt = performance.now(), stalledChecks = 0, restarting = false, stalledDuringRec = false;
+  let rvfcFrames = 0, frameHandle = 0, lastVideoTime = -1;
   const canWatchFrames = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
-  let frameHandle = 0;
   function watchFrames() {
     if (!canWatchFrames) return;
     if (frameHandle) cam.cancelVideoFrameCallback(frameHandle);
-    const onFrame = () => { lastFrameAt = performance.now(); frameHandle = cam.requestVideoFrameCallback(onFrame); };
+    const onFrame = () => {
+      rvfcFrames += 1;
+      if (rvfcFrames > 30) lastFrameAt = performance.now();
+      frameHandle = cam.requestVideoFrameCallback(onFrame);
+    };
     frameHandle = cam.requestVideoFrameCallback(onFrame);
   }
-  if (!canWatchFrames) {
-    let lastTime = -1;
-    setInterval(() => { if (cam.currentTime !== lastTime) { lastTime = cam.currentTime; lastFrameAt = performance.now(); } }, 250);
-  }
+  setInterval(() => {
+    if (canWatchFrames && rvfcFrames > 30) return;
+    if (cam.currentTime !== lastVideoTime) { lastVideoTime = cam.currentTime; lastFrameAt = performance.now(); }
+  }, 250);
 
   async function reviveVideo() {
     if (!stream) return;
@@ -559,12 +573,21 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
 
   cam.addEventListener('pause', () => { if (stream) cam.play().catch(() => {}); });
   setInterval(async () => {
-    if (!stream || restarting || document.visibilityState !== 'visible') return;
-    if (performance.now() - lastFrameAt < 1200) { stalledChecks = 0; return; }
+    if (!stream || restarting || countdownTimer || document.visibilityState !== 'visible') return;
+    const stalledMs = performance.now() - lastFrameAt;
+    if (recorder) {
+      if (stalledMs > 3000 && !stalledDuringRec) {
+        stalledDuringRec = true;
+        stopRecording();
+      }
+      return;
+    }
+    if (stalledMs < 1500) { stalledChecks = 0; return; }
     stalledChecks += 1;
-    if (stalledChecks <= 2 || recorder) {
+    if (stalledChecks <= 2) {
       await reviveVideo();
     } else {
+      stalledChecks = 0;
       restarting = true;
       await startCamera();
       restarting = false;
@@ -617,8 +640,8 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     const mime = pickMime();
     if (mime === null) { toast('Запись видео в этом браузере не поддерживается.'); return; }
     chunks = [];
-    const opts = { videoBitsPerSecond: 8000000 };
-    if (hasAudio) opts.audioBitsPerSecond = 128000;
+    // Bitrate is left to Safari: a forced high bitrate made the iPhone camera stall mid-recording.
+    const opts = {};
     if (mime) opts.mimeType = mime;
     try { recorder = new MediaRecorder(stream, opts); }
     catch { recorder = new MediaRecorder(stream); }
@@ -652,6 +675,11 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     document.body.classList.remove('recording');
     $('#btnFlip').disabled = false;
     $('#timer').hidden = true;
+    if (stalledDuringRec) {
+      stalledDuringRec = false;
+      toast('Камера iPhone остановилась, запись сохранена до этого места. Камера перезапущена.');
+      startCamera();
+    }
     if (!chunks.length) { toast('Запись получилась пустой. Попробуй ещё раз.'); return; }
     const blob = new Blob(chunks, { type });
     chunks = [];
