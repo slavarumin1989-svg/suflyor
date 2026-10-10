@@ -290,11 +290,12 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
   </div>
 </div>
 
+<script src="vendor/mp4-muxer.min.js"></script>
 <script>
 (() => {
   const $ = (s) => document.querySelector(s);
   // Bump on every release: shown in Settings and in the report, so it's clear which copy the phone runs.
-  const APP_VERSION = 8;
+  const APP_VERSION = 9;
 
   // ---------- Settings storage ----------
   const store = {
@@ -656,7 +657,11 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
   };
 
   // ---------- Recording ----------
-  let recorder = null, chunks = [], recStart = 0, timerId = null, countdownTimer = null;
+  // Main path: our own recorder. Frames from the camera are encoded to H.264 with WebCodecs, the mic to
+  // AAC, and mp4-muxer writes a plain MP4. Safari's MediaRecorder is only a fallback: on iOS 26 its MP4
+  // loses the picture after ~15-20 s while the sound goes on (WebKit bug 299164).
+  let recorder = null, recStart = 0, timerId = null, countdownTimer = null, starting = false;
+  let audioCtx = null, tapLoaded = false, framesEncoded = 0;
 
   function pickMime() {
     if (!window.MediaRecorder) return null;
@@ -664,10 +669,198 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     return types.find((t) => MediaRecorder.isTypeSupported(t)) || '';
   }
 
+  const canEncode = () => ['VideoEncoder', 'AudioEncoder', 'VideoFrame', 'AudioData', 'Mp4Muxer'].every((k) => k in window) && canWatchFrames;
+
+  // iOS only lets an AudioContext start from a tap, so it is created on the record button press
+  // (the countdown comes before the recording starts).
+  function primeAudio() {
+    try {
+      if (!audioCtx && 'AudioContext' in window) audioCtx = new AudioContext();
+      if (audioCtx && audioCtx.state !== 'running') audioCtx.resume();
+    } catch (e) { dlog('AudioContext failed: ' + e.message); }
+  }
+
+  const TAP_WORKLET = `registerProcessor('tap', class extends AudioWorkletProcessor {
+    process(inputs) { const ch = inputs[0] && inputs[0][0]; if (ch) this.port.postMessage(ch.slice(0)); return true; }
+  });`;
+
+  // Streams mono PCM blocks from the mic track to onBlock; returns a function that stops it.
+  async function tapAudio(track, onBlock) {
+    const source = audioCtx.createMediaStreamSource(new MediaStream([track]));
+    const silent = audioCtx.createGain();
+    silent.gain.value = 0;
+    silent.connect(audioCtx.destination);
+    if (audioCtx.audioWorklet && !tapLoaded) {
+      try {
+        await audioCtx.audioWorklet.addModule(URL.createObjectURL(new Blob([TAP_WORKLET], { type: 'application/javascript' })));
+        tapLoaded = true;
+      } catch (e) {
+        dlog('audio worklet failed, using ScriptProcessor: ' + e.message);
+      }
+    }
+    if (tapLoaded) {
+      const node = new AudioWorkletNode(audioCtx, 'tap');
+      node.port.onmessage = (e) => onBlock(e.data);
+      source.connect(node);
+      node.connect(silent);
+      return () => { node.port.onmessage = null; source.disconnect(); node.disconnect(); silent.disconnect(); };
+    }
+    const proc = audioCtx.createScriptProcessor(2048, 1, 1);
+    proc.onaudioprocess = (e) => onBlock(new Float32Array(e.inputBuffer.getChannelData(0)));
+    source.connect(proc);
+    proc.connect(silent);
+    return () => { proc.onaudioprocess = null; source.disconnect(); proc.disconnect(); silent.disconnect(); };
+  }
+
+  async function startEncoderRecorder() {
+    if (!canEncode()) return null;
+    const width = cam.videoWidth, height = cam.videoHeight;
+    if (!width || !height) return null;
+
+    const bitrate = state.hd ? 6000000 : 3500000;
+    let vconfig = null;
+    for (const codec of ['avc1.640028', 'avc1.4d0028', 'avc1.42e028']) {
+      const cfg = { codec, width, height, bitrate, framerate: 30, latencyMode: 'realtime', avc: { format: 'avc' } };
+      const res = await VideoEncoder.isConfigSupported(cfg).catch(() => null);
+      if (res && res.supported) { vconfig = cfg; break; }
+    }
+    if (!vconfig) { dlog('no supported H.264 encoder config'); return null; }
+
+    const micTrack = hasAudio ? stream.getAudioTracks()[0] : null;
+    let aconfig = null;
+    if (micTrack && audioCtx) {
+      const cfg = { codec: 'mp4a.40.2', sampleRate: audioCtx.sampleRate, numberOfChannels: 1, bitrate: 128000 };
+      const res = await AudioEncoder.isConfigSupported(cfg).catch(() => null);
+      if (res && res.supported) aconfig = cfg; else dlog('AAC encoder not supported, recording without sound');
+    }
+
+    const target = new Mp4Muxer.ArrayBufferTarget();
+    const muxer = new Mp4Muxer.Muxer({
+      target,
+      fastStart: 'in-memory',
+      firstTimestampBehavior: 'cross-track-offset',
+      video: { codec: 'avc', width, height },
+      ...(aconfig ? { audio: { codec: 'aac', sampleRate: aconfig.sampleRate, numberOfChannels: 1 } } : {}),
+    });
+
+    let failure = null;
+    const venc = new VideoEncoder({
+      output: (chunk, meta) => { try { muxer.addVideoChunk(chunk, meta); } catch (e) { failure = failure || e; } },
+      error: (e) => { failure = failure || e; dlog('video encoder ERROR ' + e.message); },
+    });
+    venc.configure(vconfig);
+
+    let aenc = null;
+    if (aconfig) {
+      aenc = new AudioEncoder({
+        // Safari's AAC decoderConfig.description is a whole esds box instead of an AudioSpecificConfig
+        // (WebKit bug 302253) and would give a silent track, so meta is not passed: the muxer writes its own.
+        output: (chunk) => { try { muxer.addAudioChunk(chunk); } catch (e) { failure = failure || e; } },
+        error: (e) => { failure = failure || e; dlog('audio encoder ERROR ' + e.message); },
+      });
+      aenc.configure(aconfig);
+    }
+
+    const t0 = performance.now();
+    let active = true, frames = 0, dropped = 0;
+
+    // Audio: timestamps follow the sample count from the moment the first block arrived.
+    let stopTap = null, firstBlockAt = null, samplesSent = 0, pending = [], pendingLen = 0;
+    const sr = aconfig ? aconfig.sampleRate : 0;
+    const flushAudio = () => {
+      if (!pendingLen) return;
+      const data = new Float32Array(pendingLen);
+      let o = 0;
+      for (const p of pending) { data.set(p, o); o += p.length; }
+      pending = []; pendingLen = 0;
+      const ts = Math.round((firstBlockAt - t0) * 1000 + samplesSent / sr * 1e6);
+      samplesSent += data.length;
+      if (ts < 0) return;
+      const audio = new AudioData({ format: 'f32-planar', sampleRate: sr, numberOfFrames: data.length, numberOfChannels: 1, timestamp: ts, data });
+      aenc.encode(audio);
+      audio.close();
+    };
+    if (aenc) {
+      stopTap = await tapAudio(micTrack, (block) => {
+        if (!active) return;
+        if (firstBlockAt === null) firstBlockAt = performance.now() - block.length / sr * 1000;
+        pending.push(block);
+        pendingLen += block.length;
+        if (pendingLen >= 2048) flushAudio();
+      });
+    }
+
+    // Video: one VideoFrame per painted camera frame, a key frame every 2 seconds.
+    let handle = 0;
+    const onFrame = (now) => {
+      if (!active) return;
+      handle = cam.requestVideoFrameCallback(onFrame);
+      const ts = Math.round((now - t0) * 1000);
+      if (ts < 0) return;
+      if (venc.encodeQueueSize > 4) { dropped++; return; }
+      let frame;
+      try { frame = new VideoFrame(cam, { timestamp: ts }); } catch (e) { dropped++; return; }
+      if (frame.displayWidth !== width || frame.displayHeight !== height) { frame.close(); dropped++; return; }
+      venc.encode(frame, { keyFrame: frames % 60 === 0 });
+      frame.close();
+      frames++;
+      framesEncoded++;
+    };
+    handle = cam.requestVideoFrameCallback(onFrame);
+
+    return {
+      kind: `own encoder ${vconfig.codec} ${width}x${height}${aenc ? ' + AAC ' + sr + 'Hz' : ' (no sound)'}`,
+      state: 'recording',
+      async stop() {
+        this.state = 'inactive';
+        active = false;
+        cam.cancelVideoFrameCallback(handle);
+        if (stopTap) stopTap();
+        if (aenc) flushAudio();
+        await venc.flush();
+        if (aenc) await aenc.flush();
+        venc.close();
+        if (aenc) aenc.close();
+        dlog(`encoded ${frames} frames, dropped ${dropped}, audio ${(samplesSent / (sr || 1)).toFixed(1)}s`);
+        if (failure) throw failure;
+        if (!frames) throw new Error('no video frames');
+        muxer.finalize();
+        return new Blob([target.buffer], { type: 'video/mp4' });
+      },
+    };
+  }
+
+  function startMediaRecorder() {
+    const mime = pickMime();
+    if (mime === null) return null;
+    const parts = [];
+    let mr;
+    try { mr = new MediaRecorder(stream, mime ? { mimeType: mime } : {}); }
+    catch { mr = new MediaRecorder(stream); }
+    mr.ondataavailable = (e) => { if (e.data && e.data.size) parts.push(e.data); };
+    mr.onerror = (e) => dlog('recorder ERROR ' + (e.error && e.error.name));
+    const done = new Promise((resolve) => {
+      mr.onstop = async () => {
+        const type = mr.mimeType || 'video/mp4';
+        let blob = new Blob(parts, { type });
+        if (type.includes('mp4')) blob = await repairMp4(blob);
+        resolve(blob);
+      };
+    });
+    mr.start();
+    return {
+      kind: 'MediaRecorder ' + (mr.mimeType || mime),
+      state: 'recording',
+      stop() { this.state = 'inactive'; mr.stop(); return done; },
+    };
+  }
+
   $('#btnRec').onclick = () => {
     if (recorder) { stopRecording(); return; }
     if (countdownTimer) { cancelCountdown(); return; }
+    if (starting) return;
     if (!stream) { startCamera(); return; }
+    primeAudio();
     if (state.countdown) runCountdown(); else startRecording();
   };
 
@@ -685,19 +878,20 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
   }
   function cancelCountdown() { clearInterval(countdownTimer); countdownTimer = null; $('#count').hidden = true; }
 
-  function startRecording() {
-    const mime = pickMime();
-    if (mime === null) { toast('Запись видео в этом браузере не поддерживается.'); return; }
-    chunks = [];
-    const opts = {};
-    if (mime) opts.mimeType = mime;
-    try { recorder = new MediaRecorder(stream, opts); }
-    catch { recorder = new MediaRecorder(stream); }
-    recorder.ondataavailable = (e) => { dlog('recorder data ' + (e.data ? e.data.size : 0) + ' bytes'); if (e.data && e.data.size) chunks.push(e.data); };
-    recorder.onstop = finishRecording;
-    recorder.onerror = (e) => dlog('recorder ERROR ' + (e.error && e.error.name));
-    recorder.start();
-    dlog(`recording start mime=${recorder.mimeType || mime}`);
+  async function startRecording() {
+    if (starting || recorder) return;
+    starting = true;
+    let rec = null;
+    try {
+      rec = await startEncoderRecorder();
+    } catch (e) {
+      dlog('own encoder setup failed: ' + e.message);
+    }
+    if (!rec) rec = startMediaRecorder();
+    starting = false;
+    if (!rec) { toast('Запись видео в этом браузере не поддерживается.'); return; }
+    recorder = rec;
+    dlog('recording start via ' + rec.kind);
     recStart = Date.now();
     document.body.classList.add('recording');
     $('#btnFlip').disabled = true;
@@ -708,10 +902,19 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     requestWakeLock();
   }
 
-  function stopRecording() {
+  async function stopRecording() {
+    if (!recorder || recorder.state === 'inactive') return;
     dlog('recording stop requested');
-    if (recorder && recorder.state !== 'inactive') recorder.stop();
     setPlaying(false);
+    const rec = recorder;
+    let blob = null;
+    try {
+      blob = await rec.stop();
+    } catch (e) {
+      dlog('recording failed: ' + (e && e.message));
+      toast('Запись не удалась: ' + (e && e.message));
+    }
+    finishRecording(blob);
   }
 
   function updateTimer() {
@@ -719,10 +922,10 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     $('#timerVal').textContent = String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
   }
 
-  async function finishRecording() {
-    const type = (recorder && recorder.mimeType) || 'video/mp4';
+  async function finishRecording(blob) {
     recorder = null;
     clearInterval(timerId);
+    if (audioCtx && audioCtx.state === 'running') audioCtx.suspend().catch(() => {});
     document.body.classList.remove('recording');
     $('#btnFlip').disabled = false;
     $('#timer').hidden = true;
@@ -731,10 +934,9 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
       toast('Камера iPhone остановилась, запись сохранена до этого места. Камера перезапущена.');
       startCamera();
     }
-    if (!chunks.length) { toast('Запись получилась пустой. Попробуй ещё раз.'); return; }
-    let blob = new Blob(chunks, { type });
-    chunks = [];
-    if (type.includes('mp4')) blob = await repairMp4(blob);
+    if (!blob || !blob.size) { toast('Запись получилась пустой. Попробуй ещё раз.'); return; }
+    dlog(`recording saved: ${blob.size} bytes, ${blob.type}`);
+    const type = blob.type || 'video/mp4';
     const created = Date.now();
     const item = { id: created, name: `Video_${stamp(new Date(created))}.${type.includes('mp4') ? 'mp4' : 'webm'}`, type, created, size: blob.size, blob, repaired: true };
     try { await db.put(item); } catch { toast('Не удалось сохранить запись в приложении. Сохрани её сразу.'); }
@@ -944,15 +1146,15 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
   }
 
   // One sample per second: frames painted (fps), video clock, track state.
-  let lastSample = { shown: 0 };
+  let lastSample = { shown: 0, encoded: 0 };
   setInterval(() => {
     const vt = stream && stream.getVideoTracks()[0];
     const at = stream && stream.getAudioTracks()[0];
-    const line = `fps=${framesShown - lastSample.shown}` +
+    const line = `fps=${framesShown - lastSample.shown} enc=${framesEncoded - lastSample.encoded}` +
       ` t=${cam.currentTime.toFixed(1)} vtrack=${vt ? vt.readyState + (vt.muted ? '/muted' : '') : '-'}` +
       ` atrack=${at ? at.readyState + (at.muted ? '/muted' : '') : '-'} video=${cam.paused ? 'paused' : 'play'}/${cam.readyState}` +
       ` rec=${recorder ? recorder.state : '-'} offset=${Math.round(offset)}/${Math.round(contentH)}`;
-    lastSample = { shown: framesShown };
+    lastSample = { shown: framesShown, encoded: framesEncoded };
     dlog(line);
     if (diagOn) $('#diag').textContent = line.split(' ').join('\n');
   }, 1000);
@@ -966,7 +1168,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
       'UA: ' + navigator.userAgent,
       'standalone: ' + (navigator.standalone === true) + ', screen: ' + screen.width + 'x' + screen.height + ', dpr: ' + devicePixelRatio,
       'settings: ' + JSON.stringify({ hd: state.hd, speed: state.speed, fontSize: state.fontSize, countdown: state.countdown }),
-      'rVFC: ' + canWatchFrames + ', canvas.captureStream: ' + !!HTMLCanvasElement.prototype.captureStream + ', mime: ' + pickMime(),
+      'rVFC: ' + canWatchFrames + ', own encoder: ' + canEncode() + ', mime: ' + pickMime(),
       '---',
       ...diagLog,
     ].join('\n');
