@@ -129,6 +129,8 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
 .switch { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 15px; }
 .switch input { width: 22px; height: 22px; accent-color: var(--accent); }
 .help { color: var(--muted); font-size: 14px; line-height: 1.5; margin: 0; }
+#diag { position: fixed; right: calc(env(safe-area-inset-right, 0px) + 8px); top: calc(env(safe-area-inset-top, 0px) + 52px); z-index: 10; padding: 6px 8px; border-radius: 8px; background: rgba(0,0,0,0.7); font: 11px/1.4 ui-monospace, Menlo, monospace; white-space: pre; pointer-events: none; }
+#reportText { width: 100%; flex: 1; min-height: 200px; resize: none; border: 0; border-radius: 12px; padding: 12px; background: var(--sheet-2); color: var(--ink); font: 11px/1.4 ui-monospace, Menlo, monospace; }
 
 #reviewVideo { width: 100%; max-height: 52vh; border-radius: 12px; background: #000; }
 .actions { display: grid; gap: 10px; }
@@ -186,6 +188,21 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
 </div>
 
 <div id="count" hidden></div>
+<div id="diag" hidden></div>
+
+<div class="backdrop" id="reportSheet" hidden>
+  <div class="sheet tall" role="dialog" aria-labelledby="reportTitle">
+    <div class="sheet-head">
+      <span></span>
+      <h2 id="reportTitle">Отчёт</h2>
+      <button class="link strong" type="button" data-close>Готово</button>
+    </div>
+    <div class="sheet-body editor-body">
+      <button class="btn primary wide" id="btnCopyReport" type="button">Скопировать отчёт</button>
+      <textarea id="reportText" readonly></textarea>
+    </div>
+  </div>
+</div>
 
 <div id="notice" hidden>
   <p id="noticeText"></p>
@@ -235,6 +252,8 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
       <label class="switch" for="countdown">Обратный отсчёт 3 секунды перед записью<input type="checkbox" id="countdown"></label>
       <label class="switch" for="hd">Высокое качество 1080p<input type="checkbox" id="hd"></label>
       <p class="help">По умолчанию запись идёт в 720p: так она надёжнее. В 1080p на некоторых iPhone камера может останавливаться через несколько секунд записи.</p>
+      <label class="switch" for="diagOn">Показывать диагностику на экране<input type="checkbox" id="diagOn"></label>
+      <button class="btn wide" id="btnReport" type="button">Отчёт для Claude</button>
       <p class="help">Чтобы открывать Суфлёр как приложение: в Safari нажми «Поделиться» → «На экран Домой». Записи хранятся в самом приложении, пока ты их не удалишь.</p>
     </div>
   </div>
@@ -503,6 +522,19 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
 
   $('#btnSettings').onclick = () => openSheet('#settingsSheet');
 
+  // ---------- Diagnostics ----------
+  // A rolling log the user can copy and send back: one sample per second plus every camera,
+  // track, recorder and page event. Used to find why the camera picture freezes on the iPhone.
+  const diagLog = [];
+  const t0 = performance.now();
+  let diagOn = store.get('diag', false), framesShown = 0, framesDrawn = 0;
+  function dlog(msg) {
+    diagLog.push(((performance.now() - t0) / 1000).toFixed(1) + 's ' + msg);
+    if (diagLog.length > 400) diagLog.shift();
+  }
+  window.addEventListener('error', (e) => dlog('JS error: ' + e.message));
+  window.addEventListener('unhandledrejection', (e) => dlog('promise error: ' + (e.reason && e.reason.message || e.reason)));
+
   // ---------- Camera ----------
   const cam = $('#cam');
   let stream = null, facing = 'user', hasAudio = true;
@@ -510,6 +542,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
   function stopStream() { if (stream) stream.getTracks().forEach((t) => t.stop()); stream = null; }
 
   async function startCamera() {
+    dlog(`startCamera facing=${facing} hd=${state.hd}`);
     $('#notice').hidden = true;
     stopStream();
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -523,6 +556,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
       stream = await navigator.mediaDevices.getUserMedia({ video, audio: true });
       hasAudio = true;
     } catch (err) {
+      dlog('getUserMedia with audio failed: ' + (err && err.name));
       try {
         stream = await navigator.mediaDevices.getUserMedia({ video, audio: false });
         hasAudio = false;
@@ -534,7 +568,12 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     }
     cam.srcObject = stream;
     cam.classList.toggle('mirror', facing === 'user');
-    stream.getVideoTracks().forEach((t) => { t.onended = () => { if (!recorder) startCamera(); }; });
+    stream.getTracks().forEach((t) => {
+      dlog(`camera ${t.kind} track: ${JSON.stringify(t.getSettings ? t.getSettings() : {})}`);
+      t.onmute = () => dlog(`${t.kind} track MUTE`);
+      t.onunmute = () => dlog(`${t.kind} track unmute`);
+    });
+    stream.getVideoTracks().forEach((t) => { t.onended = () => { dlog('video track ENDED'); if (!recorder) startCamera(); }; });
     lastFrameAt = performance.now(); stalledChecks = 0; rvfcFrames = 0;
     watchFrames();
     try { await cam.play(); } catch {}
@@ -552,6 +591,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     if (frameHandle) cam.cancelVideoFrameCallback(frameHandle);
     const onFrame = () => {
       rvfcFrames += 1;
+      framesShown += 1;
       if (rvfcFrames > 30) lastFrameAt = performance.now();
       frameHandle = cam.requestVideoFrameCallback(onFrame);
     };
@@ -564,6 +604,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
 
   async function reviveVideo() {
     if (!stream) return;
+    dlog('watchdog: re-attach video');
     cam.srcObject = null;
     cam.srcObject = stream;
     lastFrameAt = performance.now();
@@ -572,12 +613,16 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
   }
 
   cam.addEventListener('pause', () => { if (stream) cam.play().catch(() => {}); });
+  for (const ev of ['pause', 'playing', 'waiting', 'stalled', 'suspend', 'emptied', 'ended', 'resize']) {
+    cam.addEventListener(ev, () => dlog(`video ${ev}${ev === 'resize' ? ' ' + cam.videoWidth + 'x' + cam.videoHeight : ''}`));
+  }
   setInterval(async () => {
     if (!stream || restarting || countdownTimer || document.visibilityState !== 'visible') return;
     const stalledMs = performance.now() - lastFrameAt;
     if (recorder) {
       if (stalledMs > 3000 && !stalledDuringRec) {
         stalledDuringRec = true;
+        dlog('watchdog: stall during recording, stopping');
         stopRecording();
       }
       return;
@@ -589,6 +634,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     } else {
       stalledChecks = 0;
       restarting = true;
+      dlog('watchdog: restart camera');
       await startCamera();
       restarting = false;
     }
@@ -646,9 +692,11 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     const recStream = startCanvasPipe() || stream;
     try { recorder = new MediaRecorder(recStream, opts); }
     catch { recorder = new MediaRecorder(recStream); }
-    recorder.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+    recorder.ondataavailable = (e) => { dlog('recorder data ' + (e.data ? e.data.size : 0) + ' bytes'); if (e.data && e.data.size) chunks.push(e.data); };
     recorder.onstop = finishRecording;
+    recorder.onerror = (e) => dlog('recorder ERROR ' + (e.error && e.error.name));
     recorder.start();
+    dlog(`recording start mime=${recorder.mimeType || mime} via=${pipe ? 'canvas ' + pipe.canvas.width + 'x' + pipe.canvas.height : 'camera'}`);
     recStart = Date.now();
     document.body.classList.add('recording');
     $('#btnFlip').disabled = true;
@@ -674,7 +722,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     pipe = { canvas, active: true, handle: 0 };
     const draw = () => {
       if (!pipe || !pipe.active) return;
-      if (cam.readyState >= 2) ctx.drawImage(cam, 0, 0, canvas.width, canvas.height);
+      if (cam.readyState >= 2) { ctx.drawImage(cam, 0, 0, canvas.width, canvas.height); framesDrawn += 1; }
       pipe.handle = canWatchFrames ? cam.requestVideoFrameCallback(draw) : requestAnimationFrame(draw);
     };
     draw();
@@ -692,6 +740,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
   }
 
   function stopRecording() {
+    dlog('recording stop requested');
     if (recorder && recorder.state !== 'inactive') recorder.stop();
     setPlaying(false);
   }
@@ -817,9 +866,16 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
   // ---------- Screen awake & lifecycle ----------
   let wakeLock = null;
   async function requestWakeLock() {
-    try { if ('wakeLock' in navigator && document.visibilityState === 'visible') wakeLock = await navigator.wakeLock.request('screen'); } catch {}
+    try {
+      if ('wakeLock' in navigator && document.visibilityState === 'visible') {
+        wakeLock = await navigator.wakeLock.request('screen');
+        dlog('wake lock on');
+        wakeLock.addEventListener('release', () => dlog('wake lock released'));
+      }
+    } catch (e) { dlog('wake lock failed: ' + (e && e.name)); }
   }
   document.addEventListener('visibilitychange', () => {
+    dlog('page ' + document.visibilityState);
     if (document.visibilityState === 'visible') {
       requestWakeLock();
       if (!stream || stream.getVideoTracks().every((t) => t.readyState === 'ended')) startCamera();
@@ -832,7 +888,54 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     navigator.serviceWorker.register('sw.js').catch(() => {});
   }
 
+  // One sample per second: frames painted (fps), frames copied for recording, video clock, track state.
+  let lastSample = { shown: 0, drawn: 0 };
+  setInterval(() => {
+    const vt = stream && stream.getVideoTracks()[0];
+    const at = stream && stream.getAudioTracks()[0];
+    const line = `fps=${framesShown - lastSample.shown} rec_fps=${framesDrawn - lastSample.drawn}` +
+      ` t=${cam.currentTime.toFixed(1)} vtrack=${vt ? vt.readyState + (vt.muted ? '/muted' : '') : '-'}` +
+      ` atrack=${at ? at.readyState + (at.muted ? '/muted' : '') : '-'} video=${cam.paused ? 'paused' : 'play'}/${cam.readyState}` +
+      ` rec=${recorder ? recorder.state : '-'} offset=${Math.round(offset)}/${Math.round(contentH)}`;
+    lastSample = { shown: framesShown, drawn: framesDrawn };
+    dlog(line);
+    if (diagOn) $('#diag').textContent = line.split(' ').join('\n');
+  }, 1000);
+
+  function showDiag() { $('#diag').hidden = !diagOn; $('#diagOn').checked = diagOn; }
+  $('#diagOn').onchange = (e) => { diagOn = e.target.checked; store.set('diag', diagOn); showDiag(); };
+
+  function buildReport() {
+    return [
+      'Суфлёр — отчёт',
+      'UA: ' + navigator.userAgent,
+      'standalone: ' + (navigator.standalone === true) + ', screen: ' + screen.width + 'x' + screen.height + ', dpr: ' + devicePixelRatio,
+      'settings: ' + JSON.stringify({ hd: state.hd, speed: state.speed, fontSize: state.fontSize, countdown: state.countdown }),
+      'rVFC: ' + canWatchFrames + ', canvas.captureStream: ' + !!HTMLCanvasElement.prototype.captureStream + ', mime: ' + pickMime(),
+      '---',
+      ...diagLog,
+    ].join('\n');
+  }
+  $('#btnReport').onclick = () => {
+    $('#reportText').value = buildReport();
+    closeSheet($('#settingsSheet'));
+    openSheet('#reportSheet');
+  };
+  $('#btnCopyReport').onclick = async () => {
+    const text = $('#reportText').value;
+    try {
+      await navigator.clipboard.writeText(text);
+      toast('Отчёт скопирован. Вставь его в чат с Claude.');
+    } catch {
+      const ta = $('#reportText');
+      ta.focus(); ta.select(); ta.setSelectionRange(0, text.length);
+      toast('Текст выделен: нажми «Скопировать» в появившемся меню.');
+    }
+  };
+
+  dlog('app start, ' + navigator.userAgent);
   applySettings();
+  showDiag();
   startCamera();
   requestWakeLock();
 })();
