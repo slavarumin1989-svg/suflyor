@@ -129,6 +129,9 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
 .switch { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 15px; }
 .switch input { width: 22px; height: 22px; accent-color: var(--accent); }
 .help { color: var(--muted); font-size: 14px; line-height: 1.5; margin: 0; }
+.busy { position: fixed; inset: 0; z-index: 40; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; background: rgba(0,0,0,0.75); font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.spinner { width: 36px; height: 36px; border-radius: 50%; border: 3px solid rgba(255,255,255,0.25); border-top-color: var(--accent); animation: spin 0.9s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
 .update { position: fixed; left: 50%; top: calc(env(safe-area-inset-top, 0px) + 56px); transform: translateX(-50%); z-index: 30; display: flex; align-items: center; gap: 12px; padding: 8px 8px 8px 16px; border-radius: 999px; background: var(--sheet); font-size: 15px; white-space: nowrap; box-shadow: 0 4px 16px rgba(0,0,0,0.4); }
 .update button { padding: 6px 14px; border-radius: 999px; background: var(--accent); color: #000; font-weight: 600; }
 #diag { position: fixed; right: calc(env(safe-area-inset-right, 0px) + 8px); top: calc(env(safe-area-inset-top, 0px) + 52px); z-index: 10; padding: 6px 8px; border-radius: 8px; background: rgba(0,0,0,0.7); font: 11px/1.4 ui-monospace, Menlo, monospace; white-space: pre; pointer-events: none; }
@@ -191,6 +194,24 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
 
 <div id="count" hidden></div>
 <div id="diag" hidden></div>
+<div class="busy" id="busy" hidden><div class="spinner"></div><span id="busyText">Сохраняю видео…</span></div>
+
+<div class="backdrop" id="recoverSheet" hidden>
+  <div class="sheet" role="dialog" aria-labelledby="recoverTitle">
+    <div class="sheet-head">
+      <span></span>
+      <h2 id="recoverTitle">Незаконченная запись</h2>
+      <span></span>
+    </div>
+    <div class="sheet-body">
+      <p class="help" id="recoverText"></p>
+      <div class="actions">
+        <button class="btn primary wide" id="btnRecover" type="button">Восстановить</button>
+        <button class="btn danger wide" id="btnDiscard" type="button">Удалить</button>
+      </div>
+    </div>
+  </div>
+</div>
 <div class="update" id="updateBar" hidden>Вышла новая версия <button type="button" id="btnUpdate">Обновить</button></div>
 
 <div class="backdrop" id="reportSheet" hidden>
@@ -298,7 +319,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
 (() => {
   const $ = (s) => document.querySelector(s);
   // Bump on every release: shown in Settings and in the report, so it's clear which copy the phone runs.
-  const APP_VERSION = 14;
+  const APP_VERSION = 15;
 
   // ---------- Settings storage ----------
   const store = {
@@ -842,21 +863,37 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
   // Sound for our own recorder comes from an audio-only MediaRecorder: Safari keeps its timing right,
   // while samples pulled through Web Audio arrive ~7% short on the iPhone and the voice runs ahead of
   // the lips. The video track of Safari's MP4 is what breaks (WebKit bug 299164), the audio track is fine.
-  function startAudioRecorder(track) {
+  // It hands over a piece every 2 seconds, which goes straight to storage.
+  function startAudioRecorder(track, onPiece) {
     if (!window.MediaRecorder) return null;
     const mime = ['audio/mp4;codecs=mp4a.40.2', 'audio/mp4'].find((m) => MediaRecorder.isTypeSupported(m));
     if (!mime) { dlog('audio/mp4 MediaRecorder not supported'); return null; }
-    const parts = [];
     let mr;
     try { mr = new MediaRecorder(new MediaStream([track]), { mimeType: mime, audioBitsPerSecond: 128000 }); }
     catch (e) { dlog('audio MediaRecorder failed: ' + e.message); return null; }
     const rec = { startedAt: null, mime };
-    mr.onstart = () => { rec.startedAt = performance.now(); };
-    mr.ondataavailable = (e) => { if (e.data && e.data.size) parts.push(e.data); };
-    const done = new Promise((resolve) => { mr.onstop = () => resolve(new Blob(parts, { type: mime })); });
+    mr.onstart = () => { rec.startedAt = performance.now(); if (rec.onstart) rec.onstart(); };
+    mr.ondataavailable = (e) => { if (e.data && e.data.size) onPiece(e.data); };
+    const done = new Promise((resolve) => { mr.onstop = () => resolve(); });
     rec.stop = () => { if (mr.state !== 'inactive') mr.stop(); return done; };
-    mr.start();
+    mr.start(2000);
     return rec;
+  }
+
+  // Writes the pieces of one recording to IndexedDB in order, one at a time.
+  function pieceWriter(sid) {
+    let chain = Promise.resolve(), failed = null;
+    const seq = { v: 0, a: 0, w: 0 };
+    return {
+      put(kind, blob, index) {
+        const key = `${sid}|${kind}|${String(seq[kind]++).padStart(6, '0')}`;
+        chain = chain.then(() => db.putPart({ key, blob, index })).catch((e) => {
+          if (!failed) { failed = e; dlog('saving a piece failed: ' + (e && e.message)); }
+        });
+      },
+      done: () => chain,
+      get failed() { return failed; },
+    };
   }
 
   async function startEncoderRecorder() {
@@ -881,34 +918,65 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
       if (res && res.supported) aconfig = cfg; else dlog('AAC encoder not supported');
     }
 
-    // Encoded chunks are kept in memory and the MP4 is put together when recording stops, once it is
-    // known which sound track to use. Safari leaves chunk.duration null, so a default is filled in
-    // (the muxer derives the real duration from the next sample's timestamp anyway).
+    // Everything recorded goes to IndexedDB every second or so (see assembleSession), so the page never
+    // holds the whole recording in memory and a crash loses only the last moment.
+    if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+    const sid = String(Date.now());
+    const session = { sid, created: Number(sid), status: 'recording', width, height, codec: vconfig.codec, videoDesc: null, audioStartUs: null, webSr: aconfig ? aconfig.sampleRate : 0 };
+    await db.putSession(session);
+    const pieces = pieceWriter(sid);
+    const saveSession = () => db.putSession(session).catch((e) => dlog('saving session failed: ' + e.message));
+
+    // Safari leaves chunk.duration null, so a default is filled in (the muxer derives the real duration
+    // from the next sample's timestamp anyway).
     const chunkBytes = (chunk) => { const data = new Uint8Array(chunk.byteLength); chunk.copyTo(data); return data; };
-    const videoChunks = [], webAudioChunks = [];
-    let videoMeta = null, failure = null;
+    let failure = null;
     const fail = (e) => {
       if (failure) return;
       failure = e;
       dlog('recording error: ' + e.message);
       setTimeout(() => { if (recorder && recorder.state === 'recording') stopRecording(); }, 0);
     };
+
+    let vData = [], vIndex = [], vBytes = 0;
+    const flushVideo = () => {
+      if (!vIndex.length) return;
+      pieces.put('v', new Blob(vData), vIndex);
+      vData = []; vIndex = []; vBytes = 0;
+    };
     const venc = new VideoEncoder({
       output: (chunk, meta) => {
-        if (!videoMeta && meta && meta.decoderConfig) {
-          videoMeta = meta;
-          dlog(`first video chunk: ${chunk.type}, description ${meta.decoderConfig.description ? meta.decoderConfig.description.byteLength + ' bytes' : 'missing'}`);
+        if (!session.videoDesc && meta && meta.decoderConfig && meta.decoderConfig.description) {
+          const d = meta.decoderConfig.description;
+          session.videoDesc = d instanceof ArrayBuffer ? new Uint8Array(d.slice(0)) : new Uint8Array(d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength));
+          saveSession();
+          dlog(`first video chunk: ${chunk.type}, description ${session.videoDesc.byteLength} bytes`);
         }
-        videoChunks.push({ data: chunkBytes(chunk), type: chunk.type, ts: chunk.timestamp, dur: chunk.duration ?? 33333 });
+        const data = chunkBytes(chunk);
+        vData.push(data);
+        vIndex.push([chunk.type === 'key' ? 1 : 0, chunk.timestamp, chunk.duration ?? 33333, data.byteLength]);
+        vBytes += data.byteLength;
+        if (vIndex.length >= 30 || vBytes > 1500000) flushVideo();
       },
       error: (e) => fail(e),
     });
     venc.configure(vconfig);
 
+    let wData = [], wIndex = [];
+    const flushWeb = () => {
+      if (!wIndex.length) return;
+      pieces.put('w', new Blob(wData), wIndex);
+      wData = []; wIndex = [];
+    };
     let aenc = null;
     if (aconfig) {
       aenc = new AudioEncoder({
-        output: (chunk) => webAudioChunks.push({ data: chunkBytes(chunk), ts: chunk.timestamp, dur: chunk.duration ?? Math.round(1024 / aconfig.sampleRate * 1e6) }),
+        output: (chunk) => {
+          const data = chunkBytes(chunk);
+          wData.push(data);
+          wIndex.push([chunk.timestamp, chunk.duration ?? Math.round(1024 / aconfig.sampleRate * 1e6), data.byteLength]);
+          if (wIndex.length >= 100) flushWeb();
+        },
         error: (e) => dlog('web audio encoder error: ' + e.message),
       });
       aenc.configure(aconfig);
@@ -917,7 +985,8 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     const t0 = performance.now();
     let active = true, frames = 0, dropped = 0;
     Object.assign(av, { videoLag: NaN, captureTime: false, audioDrift: NaN, audioGaps: 0 });
-    const audioRec = micTrack ? startAudioRecorder(micTrack) : null;
+    const audioRec = micTrack ? startAudioRecorder(micTrack, (blob) => pieces.put('a', blob)) : null;
+    if (audioRec) audioRec.onstart = () => { session.audioStartUs = Math.max(0, Math.round((audioRec.startedAt - t0) * 1000)); saveSession(); };
 
     // Backup sound through Web Audio, stamped by sample count from the first block. Its drift against
     // the wall clock is only measured for the report.
@@ -994,88 +1063,166 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     };
     handle = cam.requestVideoFrameCallback(onFrame);
 
-    // Picks the sound track: Safari's audio recording if it covers the recording, else the Web Audio one.
-    async function chooseAudio(wallSeconds) {
-      let fromSafari = null, safariSeconds = 0;
-      if (audioRec) {
-        try {
-          const blob = await audioRec.stop();
-          const mp4 = readAacFromMp4(await blob.arrayBuffer());
-          const ts = mp4.timescale || 1;
-          safariSeconds = mp4.samples.reduce((a, s) => a + s.dur, 0) / ts;
-          if (mp4.samples.length && mp4.asc) {
-            const startUs = Math.max(0, ((audioRec.startedAt ?? t0) - t0) * 1000);
-            const firstDts = mp4.samples[0].dts;
-            fromSafari = {
-              source: 'Safari', sampleRate: mp4.sampleRate, channels: mp4.channels, description: mp4.asc,
-              chunks: mp4.samples.map((s) => ({
-                data: mp4.bytes.slice(s.offset, s.offset + s.size),
-                ts: Math.round(startUs + (s.dts - firstDts) / ts * 1e6),
-                dur: Math.round(s.dur / ts * 1e6),
-              })),
-            };
-          }
-          dlog(`Safari audio: ${blob.size} bytes, ${mp4.samples.length} AAC frames, ${safariSeconds.toFixed(1)}s, ${mp4.sampleRate}Hz x${mp4.channels}, start +${Math.round(((audioRec.startedAt ?? t0) - t0))}ms`);
-        } catch (e) { dlog('Safari audio unusable: ' + e.message); }
-      }
-      const webSeconds = samplesSent / (sr || 1);
-      dlog(`sound: Safari ${safariSeconds.toFixed(1)}s, Web Audio ${webSeconds.toFixed(1)}s, recording ${wallSeconds.toFixed(1)}s`);
-      if (fromSafari && safariSeconds > wallSeconds * 0.9) return fromSafari;
-      if (webAudioChunks.length) return { source: 'Web Audio', sampleRate: sr, channels: 1, description: null, chunks: webAudioChunks };
-      return fromSafari;
-    }
-
     return {
-      kind: `own encoder ${vconfig.codec} ${width}x${height}`,
+      kind: `own encoder ${vconfig.codec} ${width}x${height}, saved in pieces`,
       state: 'recording',
       async stop() {
         this.state = 'inactive';
-        const wallSeconds = (performance.now() - t0) / 1000;
         active = false;
         cam.cancelVideoFrameCallback(handle);
         if (stopTap) stopTap();
         if (aenc && firstBlockAt !== null) flushAudio();
-        await venc.flush();
+        await venc.flush().catch((e) => fail(e));
         if (aenc) { await aenc.flush().catch(() => {}); aenc.close(); }
         venc.close();
-        const audio = await chooseAudio(wallSeconds);
-        dlog(`encoded ${frames} frames, dropped ${dropped}; sound from ${audio ? audio.source : 'nowhere'}`);
-        if (failure) throw failure;
-        if (!videoChunks.length || !videoMeta) throw new Error('no video frames');
-
-        // Both tracks on one timeline starting at 0, added in time order (mp4-muxer's cross-track offset
-        // must see the earliest chunk first).
-        const all = videoChunks.map((c) => ({ ...c, video: true }));
-        if (audio) for (const c of audio.chunks) all.push({ ...c, video: false });
-        const zero = Math.min(...all.map((c) => c.ts));
-        all.sort((a, b) => a.ts - b.ts || (a.video ? -1 : 1));
-        const target = new Mp4Muxer.ArrayBufferTarget();
-        const muxer = new Mp4Muxer.Muxer({
-          target,
-          fastStart: 'in-memory',
-          firstTimestampBehavior: 'cross-track-offset',
-          video: { codec: 'avc', width, height },
-          ...(audio ? { audio: { codec: 'aac', sampleRate: audio.sampleRate, numberOfChannels: audio.channels } } : {}),
-        });
-        let firstVideo = true, firstAudio = true;
-        for (const c of all) {
-          if (c.video) {
-            muxer.addVideoChunkRaw(c.data, c.type, c.ts - zero, c.dur, firstVideo ? videoMeta : undefined);
-            firstVideo = false;
-          } else {
-            // The AudioSpecificConfig read from Safari's file is passed on; for Web Audio sound the muxer
-            // writes its own (Safari's AudioEncoder gives a whole esds box there, WebKit bug 302253).
-            const meta = firstAudio && audio.description
-              ? { decoderConfig: { codec: 'mp4a.40.2', sampleRate: audio.sampleRate, numberOfChannels: audio.channels, description: audio.description } }
-              : undefined;
-            muxer.addAudioChunkRaw(c.data, 'key', c.ts - zero, c.dur, meta);
-            firstAudio = false;
-          }
-        }
-        muxer.finalize();
-        return new Blob([target.buffer], { type: 'video/mp4' });
+        flushVideo();
+        flushWeb();
+        if (audioRec) await audioRec.stop();
+        await pieces.done();
+        session.status = 'stopped';
+        await saveSession();
+        dlog(`encoded ${frames} frames, dropped ${dropped}${pieces.failed ? ', some pieces were not saved' : ''}`);
+        if (failure && !frames) throw failure;
+        return { sid };
       },
     };
+  }
+
+  // Puts the MP4 together from a recording's stored pieces. Video is read back one stored batch at a time
+  // and the muxer streams its output to IndexedDB in ~4 MB parts, so memory use stays small whatever the
+  // length. Works the same for a recording that just stopped and for one cut short by a crash.
+  async function assembleSession(sid, onProgress = () => {}) {
+    const session = await db.getSession(sid);
+    if (!session || !session.videoDesc) throw new Error('в записи нет видео');
+    const vparts = (await db.parts(`${sid}|v|`)).filter((p) => p.index && p.index.length);
+    if (!vparts.length) throw new Error('в записи нет кадров');
+    const firstVideoTs = vparts[0].index[0][1];
+    const lastIndex = vparts[vparts.length - 1].index;
+    const videoSeconds = (lastIndex[lastIndex.length - 1][1] - firstVideoTs) / 1e6;
+
+    // Sound: Safari's recording if it covers the video, else the Web Audio backup.
+    let audio = null, safariSeconds = 0, webSeconds = 0;
+    const aparts = await db.parts(`${sid}|a|`);
+    if (aparts.length) {
+      try {
+        const mp4 = readAacFromMp4(await new Blob(aparts.map((p) => p.blob)).arrayBuffer());
+        const scale = mp4.timescale || 1;
+        safariSeconds = mp4.samples.reduce((a, s) => a + s.dur, 0) / scale;
+        if (mp4.samples.length && mp4.asc) {
+          const startUs = session.audioStartUs ?? 0, firstDts = mp4.samples[0].dts;
+          audio = {
+            source: 'Safari', sampleRate: mp4.sampleRate, channels: mp4.channels, description: mp4.asc,
+            chunks: mp4.samples.map((s) => ({
+              data: mp4.bytes.subarray(s.offset, s.offset + s.size),
+              ts: Math.round(startUs + (s.dts - firstDts) / scale * 1e6),
+              dur: Math.round(s.dur / scale * 1e6),
+            })),
+          };
+        }
+      } catch (e) { dlog('Safari audio unusable: ' + e.message); }
+    }
+    const wparts = (await db.parts(`${sid}|w|`)).filter((p) => p.index && p.index.length);
+    for (const p of wparts) for (const [, dur] of p.index) webSeconds += dur / 1e6;
+    // Safari's sound keeps lips in sync, so it is used even when a crash cut off its last 2-second piece.
+    const safariCovers = audio && safariSeconds >= Math.min(videoSeconds * 0.9, videoSeconds - 3);
+    if (!safariCovers && wparts.length && session.webSr) {
+      const chunks = [];
+      for (const p of wparts) {
+        const buf = new Uint8Array(await p.blob.arrayBuffer());
+        let off = 0;
+        for (const [ts, dur, size] of p.index) { chunks.push({ data: buf.subarray(off, off + size), ts, dur }); off += size; }
+      }
+      audio = { source: 'Web Audio', sampleRate: session.webSr, channels: 1, description: null, chunks };
+    }
+    dlog(`assemble ${sid}: video ${videoSeconds.toFixed(1)}s in ${vparts.length} pieces, sound Safari ${safariSeconds.toFixed(1)}s / Web Audio ${webSeconds.toFixed(1)}s, using ${audio ? audio.source : 'none'}`);
+
+    // Muxer output: appended in order and saved in ~4 MB parts; the one write that goes back (the mdat
+    // size in the header, written at the end) is kept as a patch.
+    const outPrefix = `${sid}|o|`;
+    await db.dropParts(outPrefix);
+    let outSeq = 0, outEnd = 0, outBuf = [], outBytes = 0;
+    const patches = [], writes = [];
+    const saveOut = (force) => {
+      if (!outBuf.length || (!force && outBytes < 4000000)) return;
+      writes.push(db.putPart({ key: outPrefix + String(outSeq++).padStart(6, '0'), blob: new Blob(outBuf) }));
+      outBuf = []; outBytes = 0;
+    };
+    const target = new Mp4Muxer.StreamTarget({
+      onData: (data, position) => {
+        if (position < outEnd) {
+          const inside = Math.min(data.byteLength, outEnd - position);
+          patches.push({ position, data: data.slice(0, inside) });
+          if (inside === data.byteLength) return;
+          data = data.subarray(inside);
+          position = outEnd;
+        }
+        if (position > outEnd) { outBuf.push(new Uint8Array(position - outEnd)); outBytes += position - outEnd; outEnd = position; }
+        outBuf.push(data);
+        outBytes += data.byteLength;
+        outEnd += data.byteLength;
+      },
+    });
+    const zero = Math.min(firstVideoTs, audio && audio.chunks.length ? audio.chunks[0].ts : Infinity);
+    const muxer = new Mp4Muxer.Muxer({
+      target,
+      fastStart: false,
+      firstTimestampBehavior: 'cross-track-offset',
+      video: { codec: 'avc', width: session.width, height: session.height },
+      ...(audio ? { audio: { codec: 'aac', sampleRate: audio.sampleRate, numberOfChannels: audio.channels } } : {}),
+    });
+    const videoMeta = { decoderConfig: { codec: session.codec, codedWidth: session.width, codedHeight: session.height, description: session.videoDesc } };
+    // The AudioSpecificConfig read from Safari's file is passed on; for Web Audio sound the muxer writes
+    // its own (Safari's AudioEncoder gives a whole esds box there, WebKit bug 302253).
+    const audioMeta = audio && audio.description
+      ? { decoderConfig: { codec: 'mp4a.40.2', sampleRate: audio.sampleRate, numberOfChannels: audio.channels, description: audio.description } }
+      : undefined;
+    let ai = 0, firstVideo = true, firstAudio = true, lastAudioTs = -1;
+    const addAudioUpTo = (limit) => {
+      while (audio && ai < audio.chunks.length && audio.chunks[ai].ts <= limit) {
+        const c = audio.chunks[ai++];
+        if (c.ts < zero || c.ts <= lastAudioTs) continue;
+        lastAudioTs = c.ts;
+        muxer.addAudioChunkRaw(c.data, 'key', c.ts - zero, c.dur, firstAudio ? audioMeta : undefined);
+        firstAudio = false;
+      }
+    };
+    for (let i = 0; i < vparts.length; i++) {
+      const buf = new Uint8Array(await vparts[i].blob.arrayBuffer());
+      let off = 0;
+      for (const [key, ts, dur, size] of vparts[i].index) {
+        addAudioUpTo(ts);
+        if (off + size <= buf.byteLength) {
+          muxer.addVideoChunkRaw(buf.subarray(off, off + size), key ? 'key' : 'delta', ts - zero, dur, firstVideo ? videoMeta : undefined);
+          firstVideo = false;
+        }
+        off += size;
+      }
+      saveOut(false);
+      if (writes.length >= 3) { await Promise.all(writes); writes.length = 0; }
+      onProgress((i + 1) / vparts.length);
+    }
+    addAudioUpTo(Infinity);
+    muxer.finalize();
+    saveOut(true);
+    await Promise.all(writes);
+
+    // The parts come back as stored files, so the finished video is assembled without loading it.
+    let blob = new Blob((await db.parts(outPrefix)).map((p) => p.blob), { type: 'video/mp4' });
+    for (const p of patches) blob = new Blob([blob.slice(0, p.position), p.data, blob.slice(p.position + p.data.byteLength)], { type: 'video/mp4' });
+    return blob;
+  }
+
+  // Assembles a recording, keeps it in «Записи» and removes its pieces.
+  async function finalizeSession(sid, onProgress) {
+    const blob = await assembleSession(sid, onProgress);
+    const created = Number(sid);
+    const item = { id: created, name: `Video_${stamp(new Date(created))}.mp4`, type: 'video/mp4', created, size: blob.size, blob, repaired: true };
+    await db.put(item);
+    const saved = (await db.get(created)) || item;
+    await db.dropParts(`${sid}|`);
+    await db.dropSession(sid);
+    dlog(`recording saved: ${saved.size} bytes`);
+    return saved;
   }
 
   function startMediaRecorder() {
@@ -1106,7 +1253,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
   $('#btnRec').onclick = () => {
     if (recorder) { stopRecording(); return; }
     if (countdownTimer) { cancelCountdown(); return; }
-    if (starting) return;
+    if (starting || busy) return;
     if (!stream) { startCamera(); return; }
     primeAudio();
     if (state.countdown) runCountdown(); else startRecording();
@@ -1155,14 +1302,14 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     dlog('recording stop requested');
     setPlaying(false);
     const rec = recorder;
-    let blob = null;
+    let result = null;
     try {
-      blob = await rec.stop();
+      result = await rec.stop();
     } catch (e) {
       dlog('recording failed: ' + (e && e.message));
       toast('Запись не удалась: ' + (e && e.message));
     }
-    finishRecording(blob);
+    finishRecording(result);
   }
 
   function updateTimer() {
@@ -1170,7 +1317,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     $('#timerVal').textContent = String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
   }
 
-  async function finishRecording(blob) {
+  async function finishRecording(result) {
     recorder = null;
     clearInterval(timerId);
     if (audioCtx && audioCtx.state === 'running') audioCtx.suspend().catch(() => {});
@@ -1182,6 +1329,12 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
       toast('Камера iPhone остановилась, запись сохранена до этого места. Камера перезапущена.');
       startCamera();
     }
+    if (result && result.sid) {
+      const item = await saveWithProgress(result.sid);
+      if (item) openReview(item);
+      return;
+    }
+    const blob = result;
     if (!blob || !blob.size) { toast('Запись получилась пустой. Попробуй ещё раз.'); return; }
     dlog(`recording saved: ${blob.size} bytes, ${blob.type}`);
     const type = blob.type || 'video/mp4';
@@ -1190,6 +1343,52 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     try { await db.put(item); } catch { toast('Не удалось сохранить запись в приложении. Сохрани её сразу.'); }
     openReview(item);
   }
+
+  // «Сохраняю видео…» while a recording is put together; on failure the pieces stay for the next start.
+  let busy = false;
+  async function saveWithProgress(sid) {
+    busy = true;
+    const box = $('#busy');
+    box.hidden = false;
+    $('#busyText').textContent = 'Сохраняю видео…';
+    try {
+      return await finalizeSession(sid, (f) => { $('#busyText').textContent = `Сохраняю видео… ${Math.round(f * 100)}%`; });
+    } catch (e) {
+      dlog('assemble failed: ' + (e && e.message));
+      toast('Не получилось собрать видео. Запись не потеряна: при следующем запуске приложение предложит её восстановить.');
+      return null;
+    } finally {
+      box.hidden = true;
+      busy = false;
+    }
+  }
+
+  // A recording cut short by a crash (or not assembled) is offered for recovery on the next start.
+  let pendingSid = null;
+  async function checkUnfinished() {
+    let sessions = [];
+    try { sessions = await db.sessions(); } catch { return; }
+    const left = sessions.filter((x) => x.status !== 'done').sort((a, b) => b.created - a.created);
+    if (!left.length || recorder || busy) return;
+    const s = left[0];
+    pendingSid = s.sid;
+    const when = new Date(s.created).toLocaleString('ru-RU', { day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' });
+    $('#recoverText').textContent = `Запись от ${when} не успела сохраниться. Её можно восстановить: пропадут максимум последние пару секунд.`;
+    openSheet('#recoverSheet');
+  }
+  $('#btnRecover').onclick = async () => {
+    closeSheet($('#recoverSheet'));
+    const item = await saveWithProgress(pendingSid);
+    if (item) openReview(item);
+    else checkUnfinished();
+  };
+  $('#btnDiscard').onclick = async () => {
+    if ($('#btnDiscard').dataset.armed !== '1') { $('#btnDiscard').dataset.armed = '1'; $('#btnDiscard').textContent = 'Точно удалить?'; return; }
+    $('#btnDiscard').dataset.armed = ''; $('#btnDiscard').textContent = 'Удалить';
+    closeSheet($('#recoverSheet'));
+    try { await db.dropParts(`${pendingSid}|`); await db.dropSession(pendingSid); } catch {}
+    checkUnfinished();
+  };
 
   function stamp(d) {
     const p = (n) => String(n).padStart(2, '0');
@@ -1277,24 +1476,41 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
   }
 
   // ---------- Storage of recordings (IndexedDB) ----------
+  // videos: finished recordings. sessions + parts: a recording in progress, stored piece by piece
+  // (keys "<sid>|<kind>|<seq>": v = video batch, a = Safari audio, w = Web Audio backup, o = MP4 output).
   const db = (() => {
     let dbp;
     const open = () => dbp || (dbp = new Promise((res, rej) => {
-      const r = indexedDB.open('teleprompter', 1);
-      r.onupgradeneeded = () => r.result.createObjectStore('videos', { keyPath: 'id' });
+      const r = indexedDB.open('teleprompter', 2);
+      r.onupgradeneeded = () => {
+        const d = r.result;
+        if (!d.objectStoreNames.contains('videos')) d.createObjectStore('videos', { keyPath: 'id' });
+        if (!d.objectStoreNames.contains('parts')) d.createObjectStore('parts', { keyPath: 'key' });
+        if (!d.objectStoreNames.contains('sessions')) d.createObjectStore('sessions', { keyPath: 'sid' });
+      };
       r.onsuccess = () => res(r.result);
       r.onerror = () => rej(r.error);
     }));
-    const run = (mode, fn) => open().then((d) => new Promise((res, rej) => {
-      const tx = d.transaction('videos', mode);
-      const req = fn(tx.objectStore('videos'));
+    const run = (store, mode, fn) => open().then((d) => new Promise((res, rej) => {
+      const tx = d.transaction(store, mode);
+      const req = fn(tx.objectStore(store));
       tx.oncomplete = () => res(req && req.result);
       tx.onerror = () => rej(tx.error);
+      tx.onabort = () => rej(tx.error);
     }));
+    const prefix = (p) => IDBKeyRange.bound(p, p + '\uffff');
     return {
-      put: (item) => run('readwrite', (s) => s.put(item)),
-      del: (id) => run('readwrite', (s) => s.delete(id)),
-      all: () => run('readonly', (s) => s.getAll()),
+      put: (item) => run('videos', 'readwrite', (s) => s.put(item)),
+      get: (id) => run('videos', 'readonly', (s) => s.get(id)),
+      del: (id) => run('videos', 'readwrite', (s) => s.delete(id)),
+      all: () => run('videos', 'readonly', (s) => s.getAll()),
+      putPart: (rec) => run('parts', 'readwrite', (s) => s.put(rec)),
+      parts: (p) => run('parts', 'readonly', (s) => s.getAll(prefix(p))),
+      dropParts: (p) => run('parts', 'readwrite', (s) => s.delete(prefix(p))),
+      putSession: (rec) => run('sessions', 'readwrite', (s) => s.put(rec)),
+      getSession: (sid) => run('sessions', 'readonly', (s) => s.get(sid)),
+      sessions: () => run('sessions', 'readonly', (s) => s.getAll()),
+      dropSession: (sid) => run('sessions', 'readwrite', (s) => s.delete(sid)),
     };
   })();
 
@@ -1457,6 +1673,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
   $('#version').textContent = 'Версия ' + APP_VERSION;
   applySettings();
   showDiag();
+  setTimeout(checkUnfinished, 1500);
   startCamera();
   requestWakeLock();
 })();

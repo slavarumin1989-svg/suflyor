@@ -1,4 +1,4 @@
-const CACHE = 'suflyor-v14';
+const CACHE = 'suflyor-v15';
 const ASSETS = ['./', './index.html', './manifest.webmanifest', './icons/icon-180.png', './icons/icon-192.png', './icons/icon-512.png', './vendor/mp4-muxer.min.js'];
 
 self.addEventListener('install', (e) => {
