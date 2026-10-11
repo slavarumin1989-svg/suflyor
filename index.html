@@ -321,7 +321,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
 (() => {
   const $ = (s) => document.querySelector(s);
   // Bump on every release: shown in Settings and in the report, so it's clear which copy the phone runs.
-  const APP_VERSION = 19;
+  const APP_VERSION = 20;
 
   // ---------- Settings storage ----------
   const store = {
@@ -561,10 +561,19 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
   const t0 = performance.now();
   const prevLog = store.get('diagLog', []);
   let diagOn = store.get('diag', false), framesShown = 0, logDirty = false;
+  // Lines about recordings, sound and errors are also kept across several launches.
+  const keyLog = store.get('diagKey', []);
+  const KEY_EVENT = /recording|assemble|Safari audio|sound|audio track ENDED|share|download|failed|error|ERROR|disk/;
   function dlog(msg) {
-    diagLog.push(((performance.now() - t0) / 1000).toFixed(1) + 's ' + msg);
+    const line = ((performance.now() - t0) / 1000).toFixed(1) + 's ' + msg;
+    diagLog.push(line);
     if (diagLog.length > 400) diagLog.shift();
     logDirty = true;
+    if (KEY_EVENT.test(msg)) {
+      keyLog.push(new Date().toLocaleString('ru-RU') + ' ' + msg);
+      while (keyLog.length > 150) keyLog.shift();
+      store.set('diagKey', keyLog);
+    }
   }
   setInterval(() => { if (logDirty) { logDirty = false; store.set('diagLog', diagLog.slice(-300)); } }, 2000);
   window.addEventListener('error', (e) => dlog('JS error: ' + e.message));
@@ -1832,6 +1841,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
       'standalone: ' + (navigator.standalone === true) + ', screen: ' + screen.width + 'x' + screen.height + ', dpr: ' + devicePixelRatio,
       'settings: ' + JSON.stringify({ hd: state.hd, speed: state.speed, fontSize: state.fontSize, countdown: state.countdown }),
       'rVFC: ' + canWatchFrames + ', own encoder: ' + canEncode() + ', mime: ' + pickMime(),
+      ...(keyLog.length ? ['--- важные события (несколько запусков) ---', ...keyLog] : []),
       ...(prevLog.length ? ['--- предыдущий запуск ---', ...prevLog.filter((l) => !/ fps=/.test(l) || /rec=recording/.test(l)).slice(-120)] : []),
       '--- этот запуск ---',
       ...diagLog,
