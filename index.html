@@ -321,7 +321,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
 (() => {
   const $ = (s) => document.querySelector(s);
   // Bump on every release: shown in Settings and in the report, so it's clear which copy the phone runs.
-  const APP_VERSION = 20;
+  const APP_VERSION = 21;
 
   // ---------- Settings storage ----------
   const store = {
@@ -616,6 +616,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
       t.onended = () => {
         dlog('audio track ENDED');
         if (recorder) toast('iPhone отключил микрофон (звонок, Siri или другое приложение). Дальше запись идёт без звука — останови её и начни заново.');
+        else if (!restarting) startCamera();
       };
     });
     stream.getTracks().forEach((t) => {
@@ -1204,7 +1205,13 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     dlog(`Safari audio pieces: ${aparts.length}, ${aparts.reduce((a, p) => a + (p.blob ? p.blob.size : 0), 0)} bytes`);
     if (aparts.length) {
       try {
-        const mp4 = readAacFromMp4(await new Blob(aparts.map((p) => p.blob)).arrayBuffer());
+        // Each piece is read on its own: reading one Blob joined from hundreds of stored ones is the kind
+        // of thing Safari got wrong before.
+        const total = aparts.reduce((a, p) => a + p.blob.size, 0);
+        const joined = new Uint8Array(total);
+        let at = 0;
+        for (const p of aparts) { joined.set(new Uint8Array(await p.blob.arrayBuffer()), at); at += p.blob.size; }
+        const mp4 = readAacFromMp4(joined.buffer);
         const scale = mp4.timescale || 1;
         safariSeconds = mp4.samples.reduce((a, s) => a + s.dur, 0) / scale;
         if (mp4.samples.length && mp4.asc) {
@@ -1222,6 +1229,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     }
     const wparts = (await db.parts(`${sid}|w|`)).filter((p) => p.index && p.index.length);
     for (const p of wparts) for (const [, dur] of p.index) webSeconds += dur / 1e6;
+    dlog(`backup audio pieces: ${wparts.length}, ${webSeconds.toFixed(1)}s`);
     // Safari's sound keeps lips in sync, so it is used even when a crash cut off its last 2-second piece.
     const safariCovers = audio && safariSeconds >= Math.min(videoSeconds * 0.9, videoSeconds - 3);
     if (!safariCovers && wparts.length && session.webSr) {
@@ -1233,6 +1241,10 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
       }
       audio = { source: 'Web Audio', sampleRate: session.webSr, channels: 1, description: null, chunks };
     }
+    if (!audio && (aparts.length || wparts.length)) {
+      throw new Error(`звук не собрался (кусков Safari ${aparts.length}, запасных ${wparts.length})`);
+    }
+    noSoundInLast = !audio;
     dlog(`assemble ${sid}: video ${videoSeconds.toFixed(1)}s in ${vparts.length} pieces, sound Safari ${safariSeconds.toFixed(1)}s / Web Audio ${webSeconds.toFixed(1)}s, using ${audio ? audio.source : 'none'}`);
 
     // Muxer output: appended in order and saved in ~4 MB parts. The one write that goes back (the mdat
@@ -1428,6 +1440,17 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
   async function startRecording() {
     if (starting || recorder) return;
     starting = true;
+    // iOS can take the microphone away while the camera keeps running (a call, Siri, another app, the
+    // share sheet). Recording on a dead mic track gives a video with no sound at all, so it is reopened.
+    const mic = stream && stream.getAudioTracks()[0];
+    if (!mic || mic.readyState === 'ended' || mic.muted) {
+      dlog(`mic not live before recording (${mic ? mic.readyState + (mic.muted ? '/muted' : '') : 'none'}), reopening camera`);
+      await startCamera();
+      const again = stream && stream.getAudioTracks()[0];
+      if (!again || again.readyState !== 'live') {
+        toast('Микрофон недоступен: видео запишется без звука. Закрой другие приложения со звуком и попробуй снова.');
+      }
+    }
     let rec = null;
     try {
       rec = await startEncoderRecorder();
@@ -1497,14 +1520,16 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
   }
 
   // «Сохраняю видео…» while a recording is put together; on failure the pieces stay for the next start.
-  let busy = false;
+  let busy = false, noSoundInLast = false;
   async function saveWithProgress(sid) {
     busy = true;
     const box = $('#busy');
     box.hidden = false;
     $('#busyText').textContent = 'Сохраняю видео…';
     try {
-      return await finalizeSession(sid, (f) => { $('#busyText').textContent = `Сохраняю видео… ${Math.round(f * 100)}%`; });
+      const item = await finalizeSession(sid, (f) => { $('#busyText').textContent = `Сохраняю видео… ${Math.round(f * 100)}%`; });
+      if (noSoundInLast) toast('Видео сохранено без звука: микрофон был недоступен во время записи.');
+      return item;
     } catch (e) {
       dlog('assemble failed: ' + (e && e.message));
       toast('Не получилось собрать видео. Запись не потеряна: при следующем запуске приложение предложит её восстановить.');
