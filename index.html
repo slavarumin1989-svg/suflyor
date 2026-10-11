@@ -321,7 +321,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
 (() => {
   const $ = (s) => document.querySelector(s);
   // Bump on every release: shown in Settings and in the report, so it's clear which copy the phone runs.
-  const APP_VERSION = 17;
+  const APP_VERSION = 18;
 
   // ---------- Settings storage ----------
   const store = {
@@ -1143,15 +1143,26 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     }
     dlog(`assemble ${sid}: video ${videoSeconds.toFixed(1)}s in ${vparts.length} pieces, sound Safari ${safariSeconds.toFixed(1)}s / Web Audio ${webSeconds.toFixed(1)}s, using ${audio ? audio.source : 'none'}`);
 
-    // Muxer output: appended in order and saved in ~4 MB parts; the one write that goes back (the mdat
-    // size in the header, written at the end) is kept as a patch.
+    // Muxer output: appended in order and saved in ~4 MB parts. The one write that goes back (the mdat
+    // size in the header, written at the end) is applied to the bytes of the part it falls in. Never
+    // via Blob.slice: on the iPhone, slicing a Blob made of stored parts returns the wrong bytes (a
+    // whole part, or the whole file), which is what broke the 11-minute recording. The first part,
+    // where the header lives, stays in memory until the end.
     const outPrefix = `${sid}|o|`;
     await db.dropParts(outPrefix);
-    let outSeq = 0, outEnd = 0, outBuf = [], outBytes = 0;
-    const patches = [], writes = [];
+    let outSeq = 0, outEnd = 0, outBuf = [], outBytes = 0, outStart = 0, head = null;
+    const patches = [], writes = [], savedParts = [];
+    const joinBytes = (list, total) => { const b = new Uint8Array(total); let o = 0; for (const x of list) { b.set(x, o); o += x.byteLength; } return b; };
     const saveOut = (force) => {
       if (!outBuf.length || (!force && outBytes < 4000000)) return;
-      writes.push(db.putPart({ key: outPrefix + String(outSeq++).padStart(6, '0'), blob: new Blob(outBuf) }));
+      const key = outPrefix + String(outSeq++).padStart(6, '0');
+      if (!head) {
+        head = { key, start: outStart, bytes: joinBytes(outBuf, outBytes) };
+      } else {
+        writes.push(db.putPart({ key, blob: new Blob(outBuf) }));
+        savedParts.push({ key, start: outStart, size: outBytes });
+      }
+      outStart += outBytes;
       outBuf = []; outBytes = 0;
     };
     const target = new Mp4Muxer.StreamTarget({
@@ -1213,9 +1224,25 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     saveOut(true);
     await Promise.all(writes);
 
-    // The parts come back as stored files, so the finished video is assembled without loading it.
-    let blob = new Blob((await db.parts(outPrefix)).map((p) => p.blob), { type: 'video/mp4' });
-    for (const p of patches) blob = new Blob([blob.slice(0, p.position), p.data, blob.slice(p.position + p.data.byteLength)], { type: 'video/mp4' });
+    for (const p of patches) {
+      const end = p.position + p.data.byteLength;
+      if (head && p.position >= head.start && end <= head.start + head.bytes.byteLength) {
+        head.bytes.set(p.data, p.position - head.start);
+        continue;
+      }
+      const part = savedParts.find((x) => p.position >= x.start && end <= x.start + x.size);
+      if (!part) throw new Error(`header fix at ${p.position} is outside the file`);
+      const rec = (await db.parts(part.key))[0];
+      const bytes = new Uint8Array(await rec.blob.arrayBuffer());
+      bytes.set(p.data, p.position - part.start);
+      await db.putPart({ key: part.key, blob: new Blob([bytes]) });
+    }
+    if (head) await db.putPart({ key: head.key, blob: new Blob([head.bytes]) });
+
+    // The parts come back as stored files and are joined whole, so the video is never loaded at once.
+    const blob = new Blob((await db.parts(outPrefix)).map((p) => p.blob), { type: 'video/mp4' });
+    dlog(`assembled ${blob.size} bytes (expected ${outEnd}), ${patches.length} header fix(es)`);
+    if (blob.size !== outEnd) throw new Error(`assembled file has ${blob.size} bytes instead of ${outEnd}`);
     return blob;
   }
 
