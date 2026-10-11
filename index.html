@@ -297,6 +297,8 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
       <div class="actions">
         <button class="btn primary wide" id="btnShare" type="button">Сохранить или отправить</button>
         <p class="help">В открывшемся меню выбери «Сохранить видео», чтобы оно попало в Фото, или Яндекс Диск, Telegram, «Сохранить в Файлы».</p>
+        <button class="btn wide" id="btnDownload" type="button">Скачать файл</button>
+        <p class="help">Если меню «Поделиться» не открывается (так бывает с длинными записями), скачай файл: он появится в «Файлы» → «Загрузки», оттуда его можно сохранить в Фото или отправить на Яндекс Диск.</p>
       </div>
     </div>
   </div>
@@ -319,7 +321,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
 (() => {
   const $ = (s) => document.querySelector(s);
   // Bump on every release: shown in Settings and in the report, so it's clear which copy the phone runs.
-  const APP_VERSION = 15;
+  const APP_VERSION = 16;
 
   // ---------- Settings storage ----------
   const store = {
@@ -1218,7 +1220,9 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     const created = Number(sid);
     const item = { id: created, name: `Video_${stamp(new Date(created))}.mp4`, type: 'video/mp4', created, size: blob.size, blob, repaired: true };
     await db.put(item);
-    const saved = (await db.get(created)) || item;
+    const readBack = await db.get(created);
+    const saved = readBack || item;
+    dlog(readBack ? `saved copy read back: ${readBack.blob && readBack.blob.size} bytes` : 'saved copy NOT read back');
     await db.dropParts(`${sid}|`);
     await db.dropSession(sid);
     dlog(`recording saved: ${saved.size} bytes`);
@@ -1527,11 +1531,28 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     }
     current = item;
     currentUrl = URL.createObjectURL(item.blob);
+    dlog(`review: ${item.name}, ${item.size} bytes, blob ${item.blob ? item.blob.size + ' ' + item.blob.type : 'missing'}`);
+    checkReadable(item.blob);
     reviewVideo.src = currentUrl;
     deleteArmed = false;
     $('#btnDelete').textContent = 'Удалить';
     openSheet('#reviewSheet');
   }
+  // Report lines that show whether a stored video can be read back at its start and end.
+  async function checkReadable(blob) {
+    const hex = (b) => [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, '0')).join('');
+    try {
+      const head = await blob.slice(0, 12).arrayBuffer();
+      const tail = await blob.slice(Math.max(0, blob.size - 12)).arrayBuffer();
+      dlog(`review: file readable, head ${hex(head)}, tail ${hex(tail)}`);
+    } catch (e) { dlog(`review: file NOT readable: ${e.name} ${e.message}`); }
+  }
+  reviewVideo.addEventListener('loadedmetadata', () => dlog(`review: player ready, ${reviewVideo.duration.toFixed(1)}s ${reviewVideo.videoWidth}x${reviewVideo.videoHeight}`));
+  reviewVideo.addEventListener('error', () => {
+    const e = reviewVideo.error;
+    if (reviewVideo.getAttribute('src')) dlog(`review: player error ${e ? e.code + ' ' + e.message : '?'}`);
+  });
+
   function closeReview() {
     reviewVideo.pause();
     reviewVideo.removeAttribute('src');
@@ -1544,15 +1565,29 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
   $('#btnShare').onclick = async () => {
     if (!current) return;
     const file = new File([current.blob], current.name, { type: current.type });
-    if (navigator.canShare && navigator.canShare({ files: [file] })) {
-      try { await navigator.share({ files: [file] }); }
-      catch (e) { if (e.name !== 'AbortError') toast('Не получилось открыть меню «Поделиться».'); }
+    const can = !!(navigator.canShare && navigator.canShare({ files: [file] }));
+    dlog(`share: ${file.size} bytes, canShare ${can}`);
+    if (can) {
+      try {
+        await navigator.share({ files: [file] });
+        dlog('share: done');
+      } catch (e) {
+        dlog(`share failed: ${e.name} ${e.message}`);
+        if (e.name !== 'AbortError') toast('Меню «Поделиться» не открылось. Нажми «Скачать файл» ниже.');
+      }
     } else {
-      const a = document.createElement('a');
-      a.href = currentUrl; a.download = current.name;
-      document.body.appendChild(a); a.click(); a.remove();
+      downloadCurrent();
     }
   };
+
+  function downloadCurrent() {
+    if (!current) return;
+    dlog(`download: ${current.name}, ${current.size} bytes`);
+    const a = document.createElement('a');
+    a.href = currentUrl; a.download = current.name;
+    document.body.appendChild(a); a.click(); a.remove();
+  }
+  $('#btnDownload').onclick = downloadCurrent;
 
   $('#btnDelete').onclick = async () => {
     if (!current) return;
