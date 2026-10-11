@@ -293,7 +293,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
       <button class="link strong" type="button" data-close>Готово</button>
     </div>
     <div class="sheet-body">
-      <video id="reviewVideo" controls playsinline></video>
+      <video id="reviewVideo" controls playsinline preload="metadata"></video>
       <div class="actions">
         <button class="btn primary wide" id="btnShare" type="button">Сохранить или отправить</button>
         <p class="help">В открывшемся меню выбери «Сохранить видео», чтобы оно попало в Фото, или Яндекс Диск, Telegram, «Сохранить в Файлы».</p>
@@ -321,7 +321,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
 (() => {
   const $ = (s) => document.querySelector(s);
   // Bump on every release: shown in Settings and in the report, so it's clear which copy the phone runs.
-  const APP_VERSION = 16;
+  const APP_VERSION = 17;
 
   // ---------- Settings storage ----------
   const store = {
@@ -555,13 +555,18 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
   // ---------- Diagnostics ----------
   // A rolling log the user can copy and send back: one sample per second plus every camera,
   // track, recorder and page event. Used to find why the camera picture freezes on the iPhone.
+  // The log is also kept in localStorage, so after iOS kills and reloads the page the report still shows
+  // what happened right before.
   const diagLog = [];
   const t0 = performance.now();
-  let diagOn = store.get('diag', false), framesShown = 0;
+  const prevLog = store.get('diagLog', []);
+  let diagOn = store.get('diag', false), framesShown = 0, logDirty = false;
   function dlog(msg) {
     diagLog.push(((performance.now() - t0) / 1000).toFixed(1) + 's ' + msg);
     if (diagLog.length > 400) diagLog.shift();
+    logDirty = true;
   }
+  setInterval(() => { if (logDirty) { logDirty = false; store.set('diagLog', diagLog.slice(-300)); } }, 2000);
   window.addEventListener('error', (e) => dlog('JS error: ' + e.message));
   window.addEventListener('unhandledrejection', (e) => dlog('promise error: ' + (e.reason && e.reason.message || e.reason)));
 
@@ -1683,7 +1688,8 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
       'standalone: ' + (navigator.standalone === true) + ', screen: ' + screen.width + 'x' + screen.height + ', dpr: ' + devicePixelRatio,
       'settings: ' + JSON.stringify({ hd: state.hd, speed: state.speed, fontSize: state.fontSize, countdown: state.countdown }),
       'rVFC: ' + canWatchFrames + ', own encoder: ' + canEncode() + ', mime: ' + pickMime(),
-      '---',
+      ...(prevLog.length ? ['--- предыдущий запуск ---', ...prevLog.filter((l) => !/ fps=/.test(l) || /rec=recording/.test(l)).slice(-120)] : []),
+      '--- этот запуск ---',
       ...diagLog,
     ].join('\n');
   }
