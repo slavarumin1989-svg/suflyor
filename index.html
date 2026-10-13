@@ -46,6 +46,17 @@ svg { width: 22px; height: 22px; display: block; }
 .top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .pill { display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; border-radius: 999px; background: var(--glass); font-size: 15px; font-weight: 600; }
 .pill svg { width: 18px; height: 18px; }
+.mid { display: flex; align-items: center; gap: 8px; }
+.mic { display: inline-flex; align-items: center; gap: 6px; padding: 9px 12px; border-radius: 999px; background: var(--glass); font-size: 13px; font-weight: 700; }
+.mic .bars { display: flex; align-items: flex-end; gap: 2px; height: 14px; }
+.mic i { width: 3px; border-radius: 1px; background: rgba(255, 255, 255, 0.3); }
+.mic i:nth-child(1) { height: 4px; } .mic i:nth-child(2) { height: 7px; } .mic i:nth-child(3) { height: 10px; } .mic i:nth-child(4) { height: 14px; }
+.mic i.on { background: #30d158; }
+.mic[data-state="dead"] { background: var(--rec); }
+.mic[data-state="dead"] i { background: rgba(255, 255, 255, 0.5); }
+.mic[data-state="unknown"] .bars { opacity: 0.5; }
+.mic b:empty { display: none; }
+.nosound { position: fixed; left: 16px; right: 16px; top: calc(env(safe-area-inset-top, 0px) + 60px); z-index: 25; padding: 14px 16px; border-radius: 14px; background: var(--rec); color: #fff; font-size: 16px; font-weight: 700; line-height: 1.35; text-align: center; box-shadow: 0 6px 20px rgba(0,0,0,0.4); }
 .timer { display: inline-flex; align-items: center; gap: 8px; padding: 8px 14px; border-radius: 999px; background: var(--glass); font-weight: 600; font-variant-numeric: tabular-nums; }
 .timer .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--rec); animation: blink 1s steps(2) infinite; }
 @keyframes blink { 50% { opacity: 0.25; } }
@@ -157,7 +168,10 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     <button class="pill" id="btnText" type="button">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 11h16M4 16h10"/></svg>Текст
     </button>
-    <div class="timer" id="timer" hidden><span class="dot"></span><span id="timerVal">00:00</span></div>
+    <div class="mid">
+      <div class="timer" id="timer" hidden><span class="dot"></span><span id="timerVal">00:00</span></div>
+      <div class="mic" id="mic" data-state="unknown" aria-label="Микрофон"><span class="bars"><i></i><i></i><i></i><i></i></span><b id="micText"></b></div>
+    </div>
     <button class="pill" id="btnRecs" type="button">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M10 9.5v5l4.5-2.5z" fill="currentColor"/></svg>Записи
     </button>
@@ -194,6 +208,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
 
 <div id="count" hidden></div>
 <div id="diag" hidden></div>
+<div class="nosound" id="noSound" hidden>Нет звука с микрофона! Если он не вернётся, запись остановится и сохранится до этого места.</div>
 <div class="busy" id="busy" hidden><div class="spinner"></div><span id="busyText">Сохраняю видео…</span></div>
 
 <div class="backdrop" id="recoverSheet" hidden>
@@ -321,7 +336,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
 (() => {
   const $ = (s) => document.querySelector(s);
   // Bump on every release: shown in Settings and in the report, so it's clear which copy the phone runs.
-  const APP_VERSION = 21;
+  const APP_VERSION = 22;
 
   // ---------- Settings storage ----------
   const store = {
@@ -525,7 +540,7 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     el.textContent = msg;
     el.hidden = false;
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => { el.hidden = true; }, 3000);
+    toastTimer = setTimeout(() => { el.hidden = true; }, Math.max(3000, msg.length * 70));
   }
 
   // Editor
@@ -727,6 +742,67 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
       if (audioCtx && audioCtx.state !== 'running') audioCtx.resume();
     } catch (e) { dlog('AudioContext failed: ' + e.message); }
   }
+  document.addEventListener('pointerdown', primeAudio, { once: true });
+
+  // ---------- Microphone watch ----------
+  // A level meter on screen and a guard: a recording does not start without sound coming from the mic,
+  // and stops (keeping what was recorded) if the mic goes dead while recording. A real microphone never
+  // gives exact digital silence, so samples that stay at zero mean iOS has cut the mic off.
+  const mic = { track: null, source: null, analyser: null, buf: null, lastSignalAt: 0, level: 0 };
+  function micTrackOk() {
+    const t = stream && stream.getAudioTracks()[0];
+    return !!t && t.readyState === 'live' && !t.muted;
+  }
+  function micState() {
+    if (!micTrackOk()) return 'dead';
+    if (!audioCtx || audioCtx.state !== 'running') return 'unknown';
+    const track = stream.getAudioTracks()[0];
+    if (mic.track !== track) {
+      try { if (mic.source) mic.source.disconnect(); } catch {}
+      mic.source = audioCtx.createMediaStreamSource(new MediaStream([track]));
+      mic.analyser = audioCtx.createAnalyser();
+      mic.analyser.fftSize = 2048;
+      mic.buf = new Float32Array(mic.analyser.fftSize);
+      const silent = audioCtx.createGain();
+      silent.gain.value = 0;
+      mic.source.connect(mic.analyser);
+      mic.analyser.connect(silent);
+      silent.connect(audioCtx.destination);
+      mic.track = track;
+      mic.lastSignalAt = performance.now();
+    }
+    mic.analyser.getFloatTimeDomainData(mic.buf);
+    let peak = 0;
+    for (let i = 0; i < mic.buf.length; i++) { const a = Math.abs(mic.buf[i]); if (a > peak) peak = a; }
+    mic.level = peak;
+    if (peak > 1e-6) mic.lastSignalAt = performance.now();
+    return performance.now() - mic.lastSignalAt > 1500 ? 'dead' : 'live';
+  }
+
+  let micDeadAt = 0;
+  setInterval(() => {
+    const st = micState();
+    const el = $('#mic');
+    if (el.dataset.state !== st) { el.dataset.state = st; if (st === 'dead') dlog('mic shows no sound'); }
+    const lit = st === 'live' ? Math.min(4, Math.ceil(Math.sqrt(mic.level) * 6)) : 0;
+    el.querySelectorAll('i').forEach((b, i) => b.classList.toggle('on', i < lit));
+    $('#micText').textContent = st === 'dead' ? 'Нет звука' : '';
+    const recording = recorder && recorder.state === 'recording';
+    if (recording && st === 'dead') {
+      if (!micDeadAt) { micDeadAt = performance.now(); dlog('sound lost during recording'); }
+      $('#noSound').hidden = false;
+      // A track taken away by iOS will not come back: stop at once. Plain zeros get a few seconds.
+      if (performance.now() - micDeadAt > (micTrackOk() ? 6000 : 1000)) {
+        dlog('recording stopped: no sound');
+        micDeadAt = 0;
+        stopRecording();
+        toast('Звук пропал, поэтому запись остановлена и сохранена до этого места. Проверь, что микрофоном не пользуется другое приложение, и нажми запись, чтобы продолжить.');
+      }
+    } else {
+      micDeadAt = 0;
+      $('#noSound').hidden = true;
+    }
+  }, 200);
 
   const TAP_WORKLET = `registerProcessor('tap', class extends AudioWorkletProcessor {
     process(inputs) { const ch = inputs[0] && inputs[0][0]; if (ch) this.port.postMessage(ch.slice(0)); return true; }
@@ -1442,13 +1518,15 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
     starting = true;
     // iOS can take the microphone away while the camera keeps running (a call, Siri, another app, the
     // share sheet). Recording on a dead mic track gives a video with no sound at all, so it is reopened.
-    const mic = stream && stream.getAudioTracks()[0];
-    if (!mic || mic.readyState === 'ended' || mic.muted) {
-      dlog(`mic not live before recording (${mic ? mic.readyState + (mic.muted ? '/muted' : '') : 'none'}), reopening camera`);
+    if (micState() === 'dead') {
+      dlog('mic dead before recording, reopening camera');
       await startCamera();
-      const again = stream && stream.getAudioTracks()[0];
-      if (!again || again.readyState !== 'live') {
-        toast('Микрофон недоступен: видео запишется без звука. Закрой другие приложения со звуком и попробуй снова.');
+      await new Promise((r) => setTimeout(r, 2000));
+      if (micState() === 'dead') {
+        starting = false;
+        dlog('mic still dead, recording not started');
+        toast('Микрофон не работает, поэтому запись не начата. Закрой приложения, которые могут занимать микрофон (звонок, музыка, диктофон), и попробуй снова.');
+        return;
       }
     }
     let rec = null;
@@ -1495,7 +1573,6 @@ body.recording #btnRec span { width: 30px; height: 30px; border-radius: 8px; }
   async function finishRecording(result) {
     recorder = null;
     clearInterval(timerId);
-    if (audioCtx && audioCtx.state === 'running') audioCtx.suspend().catch(() => {});
     document.body.classList.remove('recording');
     $('#btnFlip').disabled = false;
     $('#timer').hidden = true;
